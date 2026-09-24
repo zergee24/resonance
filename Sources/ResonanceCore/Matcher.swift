@@ -20,7 +20,7 @@ public struct Matcher: Sendable {
             highFrequencyMinimumHz: Double = 10_000,
             highFrequencyMaximumHz: Double = 20_000,
             minimumHighEnergyRatio: Double = 1e-4,
-            modelVersion: String = "1-cd-c-high"
+            modelVersion: String = "2-cd-c-high-normalized"
         ) {
             self.minimumFrequencyHz = minimumFrequencyHz
             self.maximumFrequencyHz = maximumFrequencyHz
@@ -227,6 +227,8 @@ public struct Matcher: Sendable {
             bins: detailBins,
             widths: detailWidths
         )
+        let cDeltaOffset = deltas.max() ?? 0
+        let normalizedDeltas = deltas.map { $0 - cDeltaOffset }
         var totalEnergy = 0.0
         var highEnergy = 0.0
         var weightedDelta = 0.0
@@ -257,7 +259,11 @@ public struct Matcher: Sendable {
                 zip(powers, widths).map { max(0, $0.0) * $0.1 }
             }
             let cFrameEnergy = channelEnergies.reduce(0, +)
-            let cDeltas = Array(repeating: deltas, count: channelPowerArrays.count).flatMap { $0 }
+            // JS only depends on relative gains. Subtracting one common
+            // maximum keeps the exponent bounded without changing the
+            // normalized distribution, and makes C invariant to a global
+            // curve/reference level offset.
+            let cDeltas = Array(repeating: normalizedDeltas, count: channelPowerArrays.count).flatMap { $0 }
             let q = zip(channelEnergies, cDeltas).map { energy, delta in
                 energy * safeGain(forDecibels: delta)
             }
@@ -306,11 +312,16 @@ public struct Matcher: Sendable {
             c = nil
         }
 
-        let highRangeIsComplete = minimum <= configuration.highFrequencyMinimumHz
-            && maximum >= configuration.highFrequencyMaximumHz
+        let highBinIndices = bins.filter { index in
+            let frequency = features.frequencyBinsHz[index]
+            return frequency >= configuration.highFrequencyMinimumHz
+                && frequency <= configuration.highFrequencyMaximumHz
+        }
+        let highActualMinimumHz = highBinIndices.first.map { features.frequencyBinsHz[$0] }
+        let highActualMaximumHz = highBinIndices.last.map { features.frequencyBinsHz[$0] }
         let highRatio = highEnergy / totalEnergy
         let dHigh: Double?
-        if highRangeIsComplete, highRatio >= configuration.minimumHighEnergyRatio {
+        if !highBinIndices.isEmpty, highEnergy.isFinite, highEnergy > 0 {
             var highWeightedVariance = 0.0
             var highTotal = 0.0
             for frame in features.frames {
@@ -347,7 +358,11 @@ public struct Matcher: Sendable {
         let coverageMessage = evaluationMessage(
             features: features,
             minimumHz: minimum,
-            maximumHz: maximum
+            maximumHz: maximum,
+            highMinimumHz: highActualMinimumHz,
+            highMaximumHz: highActualMaximumHz,
+            highEnergyRatio: highRatio,
+            hasHighMetric: dHigh != nil
         )
 
         return MatchResult(
@@ -372,7 +387,11 @@ public struct Matcher: Sendable {
     private func evaluationMessage(
         features: SpectrumFeatures,
         minimumHz: Double,
-        maximumHz: Double
+        maximumHz: Double,
+        highMinimumHz: Double?,
+        highMaximumHz: Double?,
+        highEnergyRatio: Double,
+        hasHighMetric: Bool
     ) -> String {
         let recordedSeconds = features.coverage.recordedDurationSeconds ?? features.durationSeconds
         let secondsText: String
@@ -398,6 +417,15 @@ public struct Matcher: Sendable {
             parts.append("覆盖范围未知")
         case .unavailable:
             parts.append("覆盖信息不可用")
+        }
+        if let highMinimumHz, let highMaximumHz {
+            var highPart = "高频实际计算 \(formatFrequency(highMinimumHz))–\(formatFrequency(highMaximumHz)) Hz"
+            if !hasHighMetric {
+                highPart += "；没有有限且非零的高频能量，D_high 暂无数值"
+            } else if highEnergyRatio < configuration.minimumHighEnergyRatio {
+                highPart += "；该段能量较少，D_high 仅基于实际高频内容"
+            }
+            parts.append(highPart)
         }
         if !features.coverage.identityConfirmed {
             parts.append("歌曲身份或播放位置尚未完全核实")
@@ -627,7 +655,7 @@ public struct Matcher: Sendable {
                     state: .noAudioContent
                 )
             }
-            let meanDelta = weightedDelta / bandEnergy
+            let meanDelta = weightedDelta / bandEnergy - globalGain
             for frame in features.frames {
                 let powers = averagedPower(frame: frame, channelCount: features.channelCount, indices: bins)
                 for (localIndex, index) in bins.enumerated() {

@@ -27,6 +27,39 @@ final class MatcherTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(result.c), 0, accuracy: 1e-12)
     }
 
+    func testCurveLevelOffsetsDoNotChangeNormalizedMetricsOrRelativeBandGain() throws {
+        let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
+        let headphoneCurve = try makeCurve(name: "headphone", values: [3, -1, 4])
+        let shiftedHeadphoneCurve = try makeCurve(name: "headphone +120", values: [123, 119, 124])
+        let shiftedReference = try makeCurve(name: "reference +120", values: [120, 120, 120], isReference: true)
+        let features = try makeFeatures(coverage: .complete)
+
+        let base = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "headphone", owned: true, curve: headphoneCurve, referenceID: reference.id),
+            reference: reference
+        )
+        let shiftedHeadphone = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "headphone +120", owned: true, curve: shiftedHeadphoneCurve, referenceID: reference.id),
+            reference: reference
+        )
+        let shiftedReferenceResult = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "headphone", owned: true, curve: headphoneCurve, referenceID: shiftedReference.id),
+            reference: shiftedReference
+        )
+
+        for result in [shiftedHeadphone, shiftedReferenceResult] {
+            XCTAssertEqual(try XCTUnwrap(result.c), try XCTUnwrap(base.c), accuracy: 1e-10)
+            XCTAssertEqual(try XCTUnwrap(result.d), try XCTUnwrap(base.d), accuracy: 1e-10)
+            XCTAssertEqual(try XCTUnwrap(result.dHigh), try XCTUnwrap(base.dHigh), accuracy: 1e-10)
+            let baseGain = try XCTUnwrap(base.frequencyBands.first(where: { $0.band.lowerHz == 16_000 })?.relativeGainDB)
+            let shiftedGain = try XCTUnwrap(result.frequencyBands.first(where: { $0.band.lowerHz == 16_000 })?.relativeGainDB)
+            XCTAssertEqual(shiftedGain, baseGain, accuracy: 1e-10)
+        }
+    }
+
     func testMissingReferenceHasNoNumbersAndUnknownCoverageIsPartial() throws {
         let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
         let headphoneCurve = try makeCurve(name: "headphone", values: [2, 0, -2])
@@ -99,7 +132,7 @@ final class MatcherTests: XCTestCase {
         XCTAssertNil(result.d)
     }
 
-    func testHighFrequencyMetricRequiresContentAndFullCoverage() throws {
+    func testHighFrequencyMetricUsesContentWhenFullRangeAvailable() throws {
         let reference = try makeCurve(name: "reference", frequencies: [20, 10_000, 20_000], values: [0, 0, 0], isReference: true)
         let headphoneCurve = try makeCurve(name: "high", frequencies: [20, 10_000, 20_000], values: [0, 4, 0])
         let headphone = Headphone(name: "high", owned: true, curve: headphoneCurve, referenceID: reference.id)
@@ -108,6 +141,25 @@ final class MatcherTests: XCTestCase {
         let result = Matcher().match(features: features, headphone: headphone, reference: reference)
         XCTAssertNotNil(result.dHigh)
         XCTAssertGreaterThan(result.highFrequencyEnergyRatio ?? 0, 1e-4)
+    }
+
+    func testHighFrequencyMetricUsesAnyFiniteEnergyAndReportsActualRange() throws {
+        let reference = try makeCurve(name: "reference", frequencies: [20, 10_000, 16_000], values: [0, 0, 0], isReference: true)
+        let headphoneCurve = try makeCurve(name: "high", frequencies: [20, 10_000, 16_000], values: [0, 4, 2])
+        let headphone = Headphone(name: "high", owned: true, curve: headphoneCurve, referenceID: reference.id)
+        let features = try makeFeatures(
+            coverage: .complete,
+            frequencies: [20, 10_000, 12_000, 16_000],
+            highFrequencyEnergy: 1e-8
+        )
+
+        let result = Matcher().match(features: features, headphone: headphone, reference: reference)
+
+        XCTAssertNotNil(result.dHigh)
+        XCTAssertGreaterThan(result.highFrequencyEnergyRatio ?? 0, 0)
+        XCTAssertLessThan(result.highFrequencyEnergyRatio ?? 1, Matcher.Configuration().minimumHighEnergyRatio)
+        XCTAssertTrue(result.message?.contains("高频实际计算 10k–16k Hz") == true)
+        XCTAssertTrue(result.message?.contains("能量较少") == true)
     }
 
     func testExtendedEvidenceKeepsNominalBandAndActualUpperBound() throws {
@@ -153,7 +205,8 @@ final class MatcherTests: XCTestCase {
         frequencies: [Double] = [20, 1_000, 20_000],
         recordedDurationSeconds: Double? = nil,
         hasUnexplainedGaps: Bool = false,
-        nonfinitePSD: Bool = false
+        nonfinitePSD: Bool = false,
+        highFrequencyEnergy: Double = 0.2
     ) throws -> SpectrumFeatures {
         let coverageValue = try Coverage(
             kind: coverage,
@@ -163,6 +216,7 @@ final class MatcherTests: XCTestCase {
         )
         let psd = frequencies.enumerated().map { index, frequency in
             if nonfinitePSD && index == 0 { return Double.nan }
+            if frequency >= 10_000 { return highFrequencyEnergy }
             return frequency == 1_000 ? 1.0 : 0.2
         }
         let frame = SpectrumFrame(startTimeSeconds: 0, sampleCount: 1_024, powerSpectralDensityByChannel: [psd, psd])

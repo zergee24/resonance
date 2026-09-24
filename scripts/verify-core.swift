@@ -147,6 +147,85 @@ private struct CoreVerification {
         let highHeadphone = Headphone(name: "high", owned: true, curve: highCurve, referenceID: reference.id)
         let highMatch = Matcher().match(features: features, headphone: highHeadphone, reference: reference)
         try check(highMatch.dHigh != nil, "D_high should be available with 12 kHz content and full 10–20 kHz coverage")
+        let shapedReference = try makeCurve(
+            name: "shaped reference",
+            frequencies: [20, 1_000, 20_000],
+            values: [0, 0, 0],
+            isReference: true
+        )
+        let shapedCurve = try makeCurve(
+            name: "shaped",
+            frequencies: [20, 1_000, 20_000],
+            values: [3, -1, 4]
+        )
+        let shiftedShapedCurve = try makeCurve(
+            name: "shaped +120",
+            frequencies: [20, 1_000, 20_000],
+            values: [123, 119, 124]
+        )
+        let shiftedShapedReference = try makeCurve(
+            name: "reference +120",
+            frequencies: [20, 1_000, 20_000],
+            values: [120, 120, 120],
+            isReference: true
+        )
+        let baseShape = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "shaped", owned: true, curve: shapedCurve, referenceID: shapedReference.id),
+            reference: shapedReference
+        )
+        let shiftedHeadphone = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "shaped +120", owned: true, curve: shiftedShapedCurve, referenceID: shapedReference.id),
+            reference: shapedReference
+        )
+        let shiftedReferenceResult = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "shaped", owned: true, curve: shapedCurve, referenceID: shiftedShapedReference.id),
+            reference: shiftedShapedReference
+        )
+        let baseC = try require(baseShape.c, "base C is missing")
+        let baseD = try require(baseShape.d, "base D is missing")
+        let baseDHigh = try require(baseShape.dHigh, "base D_high is missing")
+        let baseBandGain = try require(baseShape.frequencyBands.first(where: { $0.band.lowerHz == 16_000 })?.relativeGainDB, "base relative band gain is missing")
+        for result in [shiftedHeadphone, shiftedReferenceResult] {
+            let shiftedC = try require(result.c, "shifted C is missing")
+            let shiftedD = try require(result.d, "shifted D is missing")
+            let shiftedDHigh = try require(result.dHigh, "shifted D_high is missing")
+            try check(abs(shiftedC - baseC) < 1e-10, "C changed after a global curve/reference offset")
+            try check(abs(shiftedD - baseD) < 1e-10, "D changed after a global curve/reference offset")
+            try check(abs(shiftedDHigh - baseDHigh) < 1e-10, "D_high changed after a global curve/reference offset")
+            let bandGain = try require(result.frequencyBands.first(where: { $0.band.lowerHz == 16_000 })?.relativeGainDB, "shifted relative band gain is missing")
+            try check(abs(bandGain - baseBandGain) < 1e-10, "relative band gain changed after a global curve/reference offset")
+        }
+        print("PASS level-offset invariance: C/D/D_high and relative band gain are unchanged by +/-120 dB curve/reference shifts")
+
+        let lowHighCoverage = try Coverage(kind: .complete, intervals: [try TimeRange(startSeconds: 0, endSeconds: 1)])
+        let lowHighBins = [20.0, 10_000, 12_000, 16_000]
+        let lowHighFeatures = SpectrumFeatures(
+            sampleRate: 48_000,
+            channelCount: 1,
+            frequencyBinsHz: lowHighBins,
+            frames: [SpectrumFrame(startTimeSeconds: 0, sampleCount: 1_024, powerSpectralDensityByChannel: [[0.2, 1e-8, 1e-8, 1e-8]])],
+            durationSeconds: 1,
+            coverage: lowHighCoverage,
+            validMinHz: 20,
+            validMaxHz: 16_000,
+            frequencyValidity: .measuredContent,
+            format: AudioFormatMetadata(sampleRate: 48_000, channelCount: 1),
+            parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 0.02)
+        )
+        let lowHighReference = try makeCurve(name: "low high reference", frequencies: [20, 10_000, 16_000], values: [0, 0, 0], isReference: true)
+        let lowHighCurve = try makeCurve(name: "low high", frequencies: [20, 10_000, 16_000], values: [0, 4, 2])
+        let lowHighResult = Matcher().match(
+            features: lowHighFeatures,
+            headphone: Headphone(name: "low high", owned: true, curve: lowHighCurve, referenceID: lowHighReference.id),
+            reference: lowHighReference
+        )
+        try check(lowHighResult.dHigh != nil, "finite low-energy partial high band was blocked")
+        try check((lowHighResult.highFrequencyEnergyRatio ?? 1) > 0 && (lowHighResult.highFrequencyEnergyRatio ?? 1) < Matcher.Configuration().minimumHighEnergyRatio, "low-energy high-band threshold fixture is invalid")
+        try check(lowHighResult.message?.contains("高频实际计算 10k–16k Hz") == true && lowHighResult.message?.contains("能量较少") == true, "low-energy high-band explanation is missing")
+        print("PASS D_high partial range: finite 10–16 kHz energy is evaluated below the explanation threshold")
 
         let missingReference = Matcher().match(features: features, headphone: flatHeadphone, reference: nil)
         try check(missingReference.status == .unevaluable && missingReference.unevaluableReason == .missingReference, "missing reference was evaluated")

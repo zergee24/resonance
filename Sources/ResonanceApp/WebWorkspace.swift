@@ -166,6 +166,9 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
         case scriptEvaluationFailed(String)
         case invalidScriptResult
         case invalidSourceURL
+        case playlistWriteInProgress
+        case pendingPlaylistWriteExists
+        case playlistWriteUnavailable(String)
 
         public var errorDescription: String? {
             switch self {
@@ -187,6 +190,12 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
                 return "页面返回的数据格式无法核验。"
             case .invalidSourceURL:
                 return "页面返回了无效来源链接。"
+            case .playlistWriteInProgress:
+                return "歌单写入仍在进行，请等待当前网页操作结束。"
+            case .pendingPlaylistWriteExists:
+                return "已有一次未完成的歌单写入，请先打开目标歌单核对或明确放弃后再新建。"
+            case let .playlistWriteUnavailable(message):
+                return message
             }
         }
     }
@@ -198,6 +207,7 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
     @Published public private(set) var curveCandidates: [CurveCandidate] = []
     @Published public private(set) var curveWarnings: [String] = []
     @Published public private(set) var playlistExtraction: PlaylistExtraction?
+    @Published public private(set) var pendingPlaylistWrite: PlaylistWriteRequest?
     @Published public private(set) var loadedPageURL: URL?
     @Published public private(set) var isLoading = false
 
@@ -205,6 +215,7 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
     private var navigationGeneration = 0
     private var pendingLoad: CheckedContinuation<Void, Error>?
     private var navigationTimeoutTask: Task<Void, Never>?
+    private var playlistWriteBusy = false
 
     public init(configuration: WKWebViewConfiguration? = nil) {
         let webConfiguration = configuration ?? Self.makeConfiguration()
@@ -215,6 +226,7 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
         browserView.uiDelegate = self
         browserView.allowsBackForwardNavigationGestures = true
         browserView.setValue(false, forKey: "drawsBackground")
+        pendingPlaylistWrite = PlaylistWriter.loadPendingRequest()
     }
 
     @available(*, unavailable)
@@ -396,7 +408,58 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
         return result
     }
 
-    private func ensurePageReady() async throws {
+    /// Creates a playlist through the normal NetEase page UI and verifies the
+    /// resulting playlist by reading the rendered playlist page again.
+    public func writePlaylist(request: PlaylistWriteRequest) async throws -> PlaylistWriteResult {
+        guard !playlistWriteBusy else {
+            throw WebWorkspaceError.playlistWriteInProgress
+        }
+        playlistWriteBusy = true
+        defer { playlistWriteBusy = false }
+
+        do {
+            let result = try await PlaylistWriter(web: self).write(request: request)
+            pendingPlaylistWrite = PlaylistWriter.loadPendingRequest()
+            return result
+        } catch {
+            pendingPlaylistWrite = PlaylistWriter.loadPendingRequest()
+            throw error
+        }
+    }
+
+    /// Reads a user-confirmed target playlist URL through the normal page and
+    /// compares its rendered rows with the original request.
+    public func checkPlaylist(
+        request: PlaylistWriteRequest,
+        targetURL: URL
+    ) async throws -> PlaylistWriteResult {
+        guard !playlistWriteBusy else {
+            throw WebWorkspaceError.playlistWriteInProgress
+        }
+        playlistWriteBusy = true
+        defer { playlistWriteBusy = false }
+
+        do {
+            let result = try await PlaylistWriter(web: self).check(request: request, targetURL: targetURL)
+            pendingPlaylistWrite = PlaylistWriter.loadPendingRequest()
+            return result
+        } catch {
+            pendingPlaylistWrite = PlaylistWriter.loadPendingRequest()
+            throw error
+        }
+    }
+
+    /// Explicitly forgets the local pending receipt after the user has
+    /// confirmed the remote state. This never deletes or changes a playlist.
+    public func dismissPendingPlaylistWrite() throws {
+        guard !playlistWriteBusy else {
+            throw WebWorkspaceError.playlistWriteInProgress
+        }
+        try PlaylistWriter.dismissPendingReceipt()
+        pendingPlaylistWrite = nil
+    }
+
+    func ensurePageReady() async throws {
         if isLoading {
             try await waitForLoad()
         }
@@ -432,7 +495,7 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
         }
     }
 
-    private func evaluateJSON<T: Decodable>(_ expression: String, as type: T.Type) async throws -> T {
+    func evaluateJSON<T: Decodable>(_ expression: String, as type: T.Type) async throws -> T {
         let wrapped = "JSON.stringify((\(expression)))"
         let value: Any?
         do {
@@ -451,7 +514,7 @@ public final class WebWorkspace: NSViewController, ObservableObject, WKNavigatio
         }
     }
 
-    private static func loadResourceScript(named name: String) throws -> String {
+    static func loadResourceScript(named name: String) throws -> String {
         var bundles: [Bundle] = [Bundle.main]
         if let resourceDirectory = Bundle.main.resourceURL,
            let childBundles = try? FileManager.default.contentsOfDirectory(

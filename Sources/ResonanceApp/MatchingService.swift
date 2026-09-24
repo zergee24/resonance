@@ -78,7 +78,6 @@ extension AppModel {
                                 let match = Matcher().match(features: features, headphone: h, reference: target)
                                 let reason = Self.matchReason(
                                     track: track,
-                                    measured: measured,
                                     reference: reference,
                                     match: match
                                 )
@@ -86,6 +85,9 @@ extension AppModel {
                                     BandPresentation(low: $0.band.lowerHz, high: $0.band.upperHz, share: $0.inputEnergyFraction, gain: $0.relativeGainDB, deviation: $0.deviationContribution, status: Self.bandStatus($0.state), actualLow: $0.actualLowerHz, actualHigh: $0.actualUpperHz)
                                 }, evaluatedMin: match.evaluatedMinHz, evaluatedMax: match.evaluatedMaxHz)
                                 presentation.comparisonGroup = Self.comparisonGroup(reference: reference, match: match)
+                                if let low = match.evaluatedMinHz, let high = match.evaluatedMaxHz {
+                                    presentation.comparisonLabel = "\(reference.name) · \(String(format: "%g–%g Hz", low, high))"
+                                }
                                 presentations.append(presentation)
                             } catch {
                                 if error is CancellationError { throw error }
@@ -113,22 +115,17 @@ extension AppModel {
 
     nonisolated private static func matchReason(
         track: TrackEntry,
-        measured: LibraryCurve,
         reference: LibraryCurve,
         match: MatchResult
     ) -> String {
         let referenceName = reference.name.isEmpty ? "已选参考曲线" : reference.name
-        let system = measured.measurementSystem.trimmingCharacters(in: .whitespacesAndNewlines)
-        let systemLabel = system.isEmpty ? "测量体系未知（仅作资料说明）" : "测量体系：\(system)"
-        var parts = ["参考：\(referenceName)", systemLabel]
+        var parts = [highBandSummary(match), "参考：\(referenceName)。"]
         if let message = match.message, !message.isEmpty {
             parts.append(message)
         }
-        parts.append(highBandSummary(match))
         if let caveat = captureCaveat(track) {
             parts.append(caveat)
         }
-        parts.append("D 越小越接近参考，C 只表示谱形变化。")
         return parts.joined(separator: " ")
     }
 
@@ -169,9 +166,6 @@ extension AppModel {
         if let droppedFrames = track.droppedFrames, droppedFrames > 0 {
             notes.append("采集有 \(droppedFrames) 个丢帧")
         }
-        if !track.comparisonAllowed {
-            notes.append("播放处理或歌曲身份尚未完全核实")
-        }
         if let error = track.error?.trimmingCharacters(in: .whitespacesAndNewlines),
            !error.isEmpty,
            error != "音频已保存，等待分析" {
@@ -182,7 +176,7 @@ extension AppModel {
         for note in notes where !unique.contains(note) {
             unique.append(note)
         }
-        return "说明：\(unique.joined(separator: "；"))；数字只代表已采内容。"
+        return unique.joined(separator: "；") + "。"
     }
 
     nonisolated private static func comparisonGroup(reference: LibraryCurve, match: MatchResult) -> String {

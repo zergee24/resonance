@@ -88,6 +88,7 @@ struct MatchPresentation: Identifiable {
     var evaluatedMin: Double?
     var evaluatedMax: Double?
     var comparisonGroup = ""
+    var comparisonLabel = ""
     var eligible: Bool { d != nil }
 }
 

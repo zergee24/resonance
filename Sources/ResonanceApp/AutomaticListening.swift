@@ -58,6 +58,16 @@ extension AppModel {
         automaticListeningTick()
     }
 
+    /// Select the most recent analyzed recording only when the player exposed
+    /// an exact 网易云 ID. Titles and candidate metadata are never used to
+    /// guess that two recordings are the same song.
+    func syncFollowedPlayback() {
+        guard isFollowPlaying,
+              let snapshot = player.snapshot,
+              Date().timeIntervalSince(snapshot.observedAt) <= 3 else { return }
+        selectFollowedCache(for: snapshot)
+    }
+
     func automaticListeningTick() {
         guard !isShuttingDown else { return }
         // OCR may fail without immediately clearing the previous UI snapshot.
@@ -92,7 +102,8 @@ extension AppModel {
             return
         }
         if automaticHistorySessionID != sessionID {
-            var track = TrackEntry(
+            let cachedTrack = latestAnalyzedTrack(for: snapshot.trackID)
+            let track = TrackEntry(
                 title: snapshot.title ?? "网易云 \(snapshot.trackID ?? "未识别歌曲")",
                 artist: snapshot.artist ?? "", neteaseID: snapshot.trackID,
                 sourceURL: snapshot.trackURL?.absoluteString, duration: snapshot.duration,
@@ -102,7 +113,16 @@ extension AppModel {
                 try saveTrack(track)
                 automaticHistorySessionID = sessionID
                 automaticHistoryTrackID = track.id
-                if isFollowPlaying { selectedTrackID = track.id }
+                if isFollowPlaying {
+                    if let cachedTrack {
+                        if selectedTrackID != cachedTrack.id {
+                            selectedTrackID = cachedTrack.id
+                            recompute()
+                        }
+                    } else {
+                        selectedTrackID = track.id
+                    }
+                }
             } catch {
                 automaticListeningStatus = "歌曲信息未保存：\(error.localizedDescription)"
                 return
@@ -127,7 +147,7 @@ extension AppModel {
                     self.finishCapture(boundaryNote: "可能含切换尾音，按已录内容估计。")
                 }
                 self.lastPlayerPosition = nil
-                if self.isFollowPlaying { self.selectedTrackID = nil }
+                if self.isFollowPlaying { self.selectFollowedCache(for: snapshot) }
             case .playbackStateChanged(let state):
                 if state != .playing {
                     self.cancelCaptureStart()
@@ -154,5 +174,25 @@ extension AppModel {
             }
             self.automaticListeningTick()
         }
+    }
+
+    private func selectFollowedCache(for snapshot: PlayerSnapshot) {
+        guard isFollowPlaying else { return }
+        guard let cachedTrack = latestAnalyzedTrack(for: snapshot.trackID) else {
+            selectedTrackID = nil
+            return
+        }
+        if selectedTrackID != cachedTrack.id {
+            selectedTrackID = cachedTrack.id
+            recompute()
+        }
+    }
+
+    private func latestAnalyzedTrack(for trackID: String?) -> TrackEntry? {
+        guard let trackID = trackID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trackID.isEmpty else { return nil }
+        return tracks
+            .filter { $0.analyzed && $0.neteaseID?.trimmingCharacters(in: .whitespacesAndNewlines) == trackID }
+            .max { $0.importedAt < $1.importedAt }
     }
 }

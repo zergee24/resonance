@@ -46,6 +46,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
 
 struct MainView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showPlaylistExport = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -70,6 +71,9 @@ struct MainView: View {
         .sheet(isPresented: $model.showCurveImport) {
             if let draft = model.curveDraft { CurveImportSheet(draft: draft).environmentObject(model) }
         }
+        .sheet(isPresented: $showPlaylistExport) {
+            PlaylistExportView(workspace: model.web).environmentObject(model)
+        }
         .alert("需要处理", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("知道了") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
@@ -79,6 +83,9 @@ struct MainView: View {
         .onChange(of: model.selectedPlaylistID) { _, _ in model.recompute() }
         .onChange(of: model.sort) { _, _ in model.recompute() }
         .onChange(of: model.includePartial) { _, _ in model.recompute() }
+        .onChange(of: model.isFollowPlaying) { _, enabled in
+            if enabled { model.syncFollowedPlayback() }
+        }
 
     }
 
@@ -170,6 +177,12 @@ struct MainView: View {
                     ForEach(model.tracks) { item in Text("\(item.title) · \(item.artist.isEmpty ? item.source : item.artist)\(item.analyzed ? "" : " · 待采集")").tag(Optional(item.id)) }
                 }.labelsHidden()
                 if let track = model.selectedTrack {
+                    if model.isFollowPlaying, track.analyzed,
+                       let currentID = model.player.snapshot?.trackID,
+                       currentID == track.neteaseID, track.id != model.captureTrackID {
+                        Text("显示已有录音分析 · \(track.importedAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption).foregroundStyle(Palette.muted)
+                    }
                     HStack(spacing: 8) {
                         TinyBadge(text: track.coverageLabel, color: track.isFull ? Palette.accent : .orange)
                         TinyBadge(text: track.sampleRate.map { "\(Int($0)) Hz" } ?? "待分析")
@@ -200,6 +213,8 @@ struct MainView: View {
                 Picker("排序", selection: $model.sort) { ForEach(SongSort.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).frame(maxWidth: 380)
                 Spacer()
                 Toggle("包含采集片段", isOn: $model.includePartial).toggleStyle(.checkbox).font(.system(size: 11))
+                Button("生成网易云歌单…") { showPlaylistExport = true }
+                    .disabled(model.results.filter(\.eligible).isEmpty && model.web.pendingPlaylistWrite == nil)
                 Button("导出结果…") { model.exportCandidatePlaylist() }.disabled(model.results.filter(\.eligible).isEmpty)
             }
         }.padding(18).background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
@@ -208,15 +223,15 @@ struct MainView: View {
     private var resultsPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionCaption(title: model.mode == .song ? "耳机与这首歌" : "候选歌曲", trailing: "\(model.results.count) RESULTS")
-            if model.mode == .song && Set(model.results.filter(\.eligible).map(\.comparisonGroup)).count > 1 {
+            if Set(model.results.filter(\.eligible).map(\.comparisonGroup)).count > 1 {
                 Text("结果按参考和实际频段分组。").font(.caption).foregroundStyle(.orange)
             }
             if model.results.isEmpty {
                 EmptyPanel(icon: model.mode.icon, title: model.mode == .song ? "从你的耳机开始" : "等待真实音频", detail: model.mode == .song ? "加载耳机曲线，选一个参考，再选一首音频。" : "选择耳机，再导入或采集你想比较的歌曲。")
             } else {
                 ForEach(Array(model.results.enumerated()), id: \.element.id) { index, result in
-                    if model.mode == .song && result.eligible && (index == 0 || model.results[index - 1].comparisonGroup != result.comparisonGroup) {
-                        Text(result.subtitle).font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.accent).padding(.top, 10)
+                    if result.eligible && (index == 0 || model.results[index - 1].comparisonGroup != result.comparisonGroup) {
+                        Text(result.comparisonLabel).font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.accent).padding(.top, 10)
                     }
                     Button { model.selectedResultID = result.id } label: {
                         VStack(alignment: .leading, spacing: 9) {
