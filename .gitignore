@@ -1,0 +1,17 @@
+.build/
+.swiftpm/
+dist/
+.DS_Store
+test-output/
+*.xcuserstate
+.env
+.env.*
+*.dmg
+*.caf
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>local.tony.Resonance</string>
+<key>CFBundleName</key><string>共鸣</string>
+<key>CFBundleDisplayName</key><string>共鸣 · AI 歌单</string>
+<key>CFBundleExecutable</key><string>Resonance</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSMinimumSystemVersion</key><string>14.2</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSAudioCaptureUsageDescription</key><string>采集你选定的网易云播放器音频，在本机计算歌曲频谱与耳机适配。不会采集麦克风。</string>
+<key>NSPrincipalClass</key><string>NSApplication</string>
+</dict></plist>
