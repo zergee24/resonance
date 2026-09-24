@@ -150,20 +150,29 @@ private struct CoreVerification {
 
         let missingReference = Matcher().match(features: features, headphone: flatHeadphone, reference: nil)
         try check(missingReference.status == .unevaluable && missingReference.unevaluableReason == .missingReference, "missing reference was evaluated")
+        try check(missingReference.c == nil && missingReference.d == nil, "missing reference produced numeric output")
         let unknownFeatures = try analyzer.analyze(samples: [left, right], sampleRate: sampleRate)
         let missingCoverage = Matcher().match(features: unknownFeatures, headphone: flatHeadphone, reference: reference)
-        try check(missingCoverage.status == .unevaluable && missingCoverage.unevaluableReason == .missingCoverage, "unknown coverage was evaluated")
+        try check(missingCoverage.status == .partial && missingCoverage.c != nil && missingCoverage.d != nil, "unknown coverage with PSD was not estimated")
         let recordedOnly = try Coverage(kind: .partial, recordedDurationSeconds: 1)
         let recordedFeatures = replacingCoverage(features, with: recordedOnly)
         let recordedMatch = Matcher().match(features: recordedFeatures, headphone: flatHeadphone, reference: reference)
         try check(recordedOnly.isUsable && recordedMatch.status == .partial, "recorded-only partial coverage was not usable")
         let gapped = try Coverage(kind: .partial, recordedDurationSeconds: 1, hasUnexplainedGaps: true)
         let gappedMatch = Matcher().match(features: replacingCoverage(features, with: gapped), headphone: flatHeadphone, reference: reference)
-        try check(!gapped.isUsable && gappedMatch.unevaluableReason == .missingCoverage, "gapped partial coverage was evaluated")
+        try check(!gapped.isUsable && gappedMatch.status == .partial && gappedMatch.d == recordedMatch.d && gappedMatch.c == recordedMatch.c, "gaps changed the PSD estimate or were rejected")
+        try check(gappedMatch.message?.contains("缺口未按静音补入") == true, "gapped estimate did not explain the gap handling")
+        let arbitraryReference = try makeCurve(name: "arbitrary", frequencies: [20, 20_000], values: [0, 0], isReference: false)
+        let mismatchedIdentity = Headphone(name: "flat", owned: true, curve: flatCurve, referenceID: UUID())
+        let arbitraryMatch = Matcher().match(features: features, headphone: mismatchedIdentity, reference: arbitraryReference)
+        try check(arbitraryMatch.d != nil, "explicit reference was blocked by persistence identity metadata")
+        let nonfiniteFeatures = replacingPSD(features, with: .nan)
+        let nonfiniteMatch = Matcher().match(features: nonfiniteFeatures, headphone: flatHeadphone, reference: reference)
+        try check(nonfiniteMatch.status == .unevaluable && nonfiniteMatch.unevaluableReason == .invalidInput && nonfiniteMatch.d == nil, "non-finite PSD was accepted")
         let legacyJSON = Data("{\"kind\":\"partial\",\"mediaDurationSeconds\":null,\"intervals\":[],\"hasUnexplainedGaps\":false,\"identityConfirmed\":false}".utf8)
         let legacy = try JSONDecoder().decode(Coverage.self, from: legacyJSON)
         try check(legacy.recordedDurationSeconds == nil && !legacy.isUsable, "legacy coverage without recorded duration changed meaning")
-        print("PASS C/D/D_high and guard conditions: flat C=D=0, high D_high available, recorded-only partial usable, gaps/unknown rejected")
+        print("PASS C/D/D_high and guard conditions: missing reference has no numbers, explicit reference works, unknown/gaps estimate from PSD, non-finite PSD rejected")
     }
 
     private static func verifyEnergyIntegration() throws {
@@ -273,6 +282,36 @@ private struct CoreVerification {
             frames: features.frames,
             durationSeconds: features.durationSeconds,
             coverage: coverage,
+            validMinHz: features.validMinHz,
+            validMaxHz: features.validMaxHz,
+            frequencyValidity: features.frequencyValidity,
+            format: features.format,
+            parameters: features.parameters,
+            analyzerVersion: features.analyzerVersion
+        )
+    }
+
+    private static func replacingPSD(_ features: SpectrumFeatures, with value: Double) -> SpectrumFeatures {
+        let frames = features.frames.map { frame in
+            SpectrumFrame(
+                startTimeSeconds: frame.startTimeSeconds,
+                sampleCount: frame.sampleCount,
+                powerSpectralDensityByChannel: frame.powerSpectralDensityByChannel.map { channel in
+                    guard !channel.isEmpty else { return channel }
+                    var changed = channel
+                    changed[0] = value
+                    return changed
+                }
+            )
+        }
+        return SpectrumFeatures(
+            recordingID: features.recordingID,
+            sampleRate: features.sampleRate,
+            channelCount: features.channelCount,
+            frequencyBinsHz: features.frequencyBinsHz,
+            frames: frames,
+            durationSeconds: features.durationSeconds,
+            coverage: features.coverage,
             validMinHz: features.validMinHz,
             validMaxHz: features.validMaxHz,
             frequencyValidity: features.frequencyValidity,

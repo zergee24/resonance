@@ -5,7 +5,6 @@ import UniformTypeIdentifiers
 
 extension AppModel {
     func recompute() {
-        exportRevision = UUID()
         matchTask?.cancel()
         results = []; selectedResultID = nil
         spectrumLine = []; spectrumFrequencies = []
@@ -21,7 +20,6 @@ extension AppModel {
             candidates = tracks.filter { (scope == nil || scope!.contains($0.id)) && (!($0.analyzed) || includePartial || $0.isFull) }
         }
         let devices = headphones.filter { currentMode == .song ? $0.owned : $0.id == headphoneID }
-        let allDevices = headphones.filter(\.owned)
         let curveLibrary = curves
         let sortMode = sort
         matching = true
@@ -36,56 +34,63 @@ extension AppModel {
                             for device in devices { presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "等待实际音频采集或导入")) }
                             continue
                         }
-                        let features = try LocalStore.readArtifact(SpectrumFeatures.self, from: URL(fileURLWithPath: path))
+                        let features: SpectrumFeatures
+                        do {
+                            features = try LocalStore.readArtifact(SpectrumFeatures.self, from: URL(fileURLWithPath: path))
+                        } catch {
+                            if error is CancellationError { throw error }
+                            for device in devices {
+                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "频谱读取失败：\(error.localizedDescription)"))
+                            }
+                            continue
+                        }
                         if currentMode == .song {
                             plotX = features.frequencyBinsHz
                             var sum = Array(repeating: 0.0, count: plotX.count)
-                            for frame in features.frames { for channel in frame.powerSpectralDensityByChannel { for (i, value) in channel.enumerated() { sum[i] += value } } }
-                            let count = Double(max(1, features.frames.count * features.channelCount))
-                            plotY = sum.map { 10 * log10(max(1e-14, $0 / count)) }
+                            var validChannelCount = 0
+                            for frame in features.frames {
+                                for channel in frame.powerSpectralDensityByChannel {
+                                    guard channel.count == plotX.count, channel.allSatisfy(\.isFinite) else { continue }
+                                    validChannelCount += 1
+                                    for index in sum.indices {
+                                        sum[index] += channel[index]
+                                    }
+                                }
+                            }
+                            let count = Double(max(1, validChannelCount))
+                            plotY = validChannelCount == 0 ? [] : sum.map { 10 * log10(max(1e-14, $0 / count)) }
                         }
                         for device in devices {
                             try Task.checkCancellation()
-                            guard track.comparisonAllowed else {
-                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: track.error ?? "采集处理状态未确认或存在丢帧；保留频谱，不生成通用耳机排名")); continue
-                            }
-                            guard let measured = curveLibrary.first(where: { $0.id == device.curveID }) else {
-                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "缺少实测曲线")); continue
-                            }
-                            guard let reference = curveLibrary.first(where: { $0.id == device.referenceID && $0.isReference }) else {
-                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "请在资料库关联兼容的参考曲线")); continue
-                            }
-                            guard !measured.measurementSystem.isEmpty, reference.measurementSystem == measured.measurementSystem else {
-                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "测量体系未知或与参考不一致，不能比较")); continue
-                            }
-                            guard measured.validMin <= 20, measured.validMax >= 20_000, reference.validMin <= 20, reference.validMax >= 20_000, features.validMaxHz >= 20_000 else {
-                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "20 Hz–20 kHz 覆盖不完整；不与完整范围混排")); continue
-                            }
-                            let curve = try Self.coreCurve(measured)
-                            let target = try Self.coreCurve(reference)
-                            let h = Headphone(id: device.id, name: device.name, owned: device.owned, curve: curve, referenceID: target.id)
-                            let match = Matcher().match(features: features, headphone: h, reference: target)
-                            var reason = "\(reference.name) · \(measured.measurementSystem)；D 越小越接近参考，C 只表示谱形变化。测量变动未量化。"
-                            if let message = match.message { reason += " \(message)" }
-                            var presentation = MatchPresentation(trackID: track.id, headphoneID: device.id, name: currentMode == .song ? device.name : track.title, subtitle: "\(track.coverageLabel) · \(currentMode == .song ? reference.name : track.artist)", c: match.c, d: match.d, high: match.dHigh, reason: reason, bands: match.frequencyBands.map {
-                                BandPresentation(low: $0.band.lowerHz, high: $0.band.upperHz, share: $0.inputEnergyFraction, gain: $0.relativeGainDB, deviation: $0.deviationContribution, status: Self.bandStatus($0.state), actualLow: $0.actualLowerHz, actualHigh: $0.actualUpperHz)
-                            }, evaluatedMin: match.evaluatedMinHz, evaluatedMax: match.evaluatedMaxHz)
-                            if currentMode == .headphone && sortMode != .character {
-                                let others = allDevices.filter { $0.id != device.id && $0.referenceID == reference.id }
-                                var otherScores: [Double] = []
-                                for other in others {
-                                    guard let otherCurve = curveLibrary.first(where: { $0.id == other.curveID }), otherCurve.measurementSystem == measured.measurementSystem, otherCurve.validMin <= 20, otherCurve.validMax >= 20_000 else { continue }
-                                    let otherResult = Matcher().match(features: features, headphone: Headphone(id: other.id, name: other.name, owned: true, curve: try Self.coreCurve(otherCurve), referenceID: target.id), reference: target)
-                                    if let value = sortMode == .high ? otherResult.dHigh : otherResult.d { otherScores.append(value) }
+                            do {
+                                guard let measured = curveLibrary.first(where: { $0.id == device.curveID }) else {
+                                    presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "缺少耳机实测曲线，暂时不能计算")); continue
                                 }
-                                if !otherScores.isEmpty, let value = sortMode == .high ? match.dHigh : match.d {
-                                    let ordered = otherScores.sorted(), mid = ordered.count / 2
-                                    let median = ordered.count % 2 == 0 ? (ordered[mid - 1] + ordered[mid]) / 2 : ordered[mid]
-                                    presentation.advantage = median - value
+                                guard let selectedReferenceID = device.referenceID else {
+                                    presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "请先选择参考曲线，暂时不能计算")); continue
                                 }
+                                guard let reference = curveLibrary.first(where: { $0.id == selectedReferenceID }) else {
+                                    presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "找不到已选择的参考曲线，暂时不能计算")); continue
+                                }
+                                let curve = try Self.coreCurve(measured)
+                                let target = try Self.coreCurve(reference)
+                                let h = Headphone(id: device.id, name: device.name, owned: device.owned, curve: curve, referenceID: target.id)
+                                let match = Matcher().match(features: features, headphone: h, reference: target)
+                                let reason = Self.matchReason(
+                                    track: track,
+                                    measured: measured,
+                                    reference: reference,
+                                    match: match
+                                )
+                                var presentation = MatchPresentation(trackID: track.id, headphoneID: device.id, name: currentMode == .song ? device.name : track.title, subtitle: "\(track.coverageLabel) · \(currentMode == .song ? reference.name : track.artist)", c: match.c, d: match.d, high: match.dHigh, reason: reason, bands: match.frequencyBands.map {
+                                    BandPresentation(low: $0.band.lowerHz, high: $0.band.upperHz, share: $0.inputEnergyFraction, gain: $0.relativeGainDB, deviation: $0.deviationContribution, status: Self.bandStatus($0.state), actualLow: $0.actualLowerHz, actualHigh: $0.actualUpperHz)
+                                }, evaluatedMin: match.evaluatedMinHz, evaluatedMax: match.evaluatedMaxHz)
+                                presentation.comparisonGroup = Self.comparisonGroup(reference: reference, match: match)
+                                presentations.append(presentation)
+                            } catch {
+                                if error is CancellationError { throw error }
+                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "曲线读取失败：\(error.localizedDescription)"))
                             }
-                            presentation.comparisonGroup = "\(reference.id.uuidString):\(measured.measurementSystem)"
-                            presentations.append(presentation)
                         }
                     }
                     return (Self.ordered(presentations, mode: currentMode, sort: sortMode), plotX, plotY)
@@ -94,7 +99,7 @@ extension AppModel {
                 results = output.0; spectrumFrequencies = output.1; spectrumLine = output.2
                 selectedResultID = results.first?.id
                 matching = false
-                status = "已评估 \(results.filter(\.eligible).count) 项 · 所有结果来自真实频响与音频"
+                status = "已处理 \(results.filter(\.eligible).count) 项 · 数字来自已采频谱；覆盖不足会标注为估计"
             } catch {
                 guard !Task.isCancelled else { return }
                 matching = false; report(error)
@@ -104,6 +109,86 @@ extension AppModel {
 
     nonisolated private static func unavailable(track: TrackEntry, device: HeadphoneEntry, mode: WorkMode, reason: String) -> MatchPresentation {
         MatchPresentation(trackID: track.id, headphoneID: device.id, name: mode == .song ? device.name : track.title, subtitle: track.coverageLabel, reason: reason, bands: [])
+    }
+
+    nonisolated private static func matchReason(
+        track: TrackEntry,
+        measured: LibraryCurve,
+        reference: LibraryCurve,
+        match: MatchResult
+    ) -> String {
+        let referenceName = reference.name.isEmpty ? "已选参考曲线" : reference.name
+        let system = measured.measurementSystem.trimmingCharacters(in: .whitespacesAndNewlines)
+        let systemLabel = system.isEmpty ? "测量体系未知（仅作资料说明）" : "测量体系：\(system)"
+        var parts = ["参考：\(referenceName)", systemLabel]
+        if let message = match.message, !message.isEmpty {
+            parts.append(message)
+        }
+        parts.append(highBandSummary(match))
+        if let caveat = captureCaveat(track) {
+            parts.append(caveat)
+        }
+        parts.append("D 越小越接近参考，C 只表示谱形变化。")
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated private static func highBandSummary(_ match: MatchResult) -> String {
+        let highBands = match.frequencyBands.filter { $0.band.upperHz > 10_000 && $0.band.lowerHz < 20_000 }
+        let samples = highBands.compactMap { evidence -> (gain: Double, share: Double)? in
+            guard let gain = evidence.relativeGainDB, let share = evidence.inputEnergyFraction,
+                  gain.isFinite, share.isFinite, share > 0 else { return nil }
+            return (gain, share)
+        }
+        guard !samples.isEmpty else {
+            if let maximum = match.evaluatedMaxHz, maximum <= 10_000 {
+                return "10–20 kHz 不在实际计算频段，暂无该段概括。"
+            }
+            return "10–20 kHz 没有足够歌曲能量，暂不概括。"
+        }
+        let totalShare = samples.reduce(0) { $0 + $1.share }
+        let weightedGain = samples.reduce(0) { $0 + $1.gain * $1.share } / totalShare
+        guard totalShare.isFinite, totalShare > 0, weightedGain.isFinite else {
+            return "10–20 kHz 没有足够歌曲能量，暂不概括。"
+        }
+        let direction = weightedGain > 0 ? "提升" : (weightedGain < 0 ? "衰减" : "接近不变")
+        return "10–20 kHz 相对参考为\(direction)（约 \(String(format: "%+.1f", weightedGain)) dB）；歌曲该频段约占已计算能量 \(energyShareLabel(totalShare))。"
+    }
+
+    nonisolated private static func energyShareLabel(_ share: Double) -> String {
+        let percent = share * 100
+        if percent < 0.01 { return "<0.01%" }
+        if percent < 1 { return String(format: "%.2f%%", percent) }
+        return String(format: "%.0f%%", percent)
+    }
+
+    nonisolated private static func captureCaveat(_ track: TrackEntry) -> String? {
+        var notes: [String] = []
+        if let analysisNotes = track.analysisNotes {
+            notes.append(contentsOf: analysisNotes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.prefix(2))
+        }
+        if let droppedFrames = track.droppedFrames, droppedFrames > 0 {
+            notes.append("采集有 \(droppedFrames) 个丢帧")
+        }
+        if !track.comparisonAllowed {
+            notes.append("播放处理或歌曲身份尚未完全核实")
+        }
+        if let error = track.error?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !error.isEmpty,
+           error != "音频已保存，等待分析" {
+            notes.append(error.replacingOccurrences(of: "不参与自动排名", with: "未完全核实"))
+        }
+        guard !notes.isEmpty else { return nil }
+        var unique: [String] = []
+        for note in notes where !unique.contains(note) {
+            unique.append(note)
+        }
+        return "说明：\(unique.joined(separator: "；"))；数字只代表已采内容。"
+    }
+
+    nonisolated private static func comparisonGroup(reference: LibraryCurve, match: MatchResult) -> String {
+        let minimum = match.evaluatedMinHz.map { String(format: "%.6g", $0) } ?? "未知"
+        let maximum = match.evaluatedMaxHz.map { String(format: "%.6g", $0) } ?? "未知"
+        return "\(reference.id.uuidString):\(minimum)-\(maximum)"
     }
 
     nonisolated private static func coreCurve(_ value: LibraryCurve) throws -> Curve {
@@ -116,32 +201,48 @@ extension AppModel {
 
     nonisolated private static func ordered(_ values: [MatchPresentation], mode: WorkMode, sort: SongSort) -> [MatchPresentation] {
         let unavailable = values.filter { !$0.eligible }
-        var available = values.filter(\.eligible)
-        if mode == .headphone {
-            if sort == .high { available = available.filter { $0.high != nil } }
-            return available.enumerated().sorted { a, b in
-                if sort == .character { return a.element.c == b.element.c ? a.offset < b.offset : (a.element.c ?? 0) > (b.element.c ?? 0) }
-                if a.element.advantage != b.element.advantage { return (a.element.advantage ?? -.infinity) > (b.element.advantage ?? -.infinity) }
-                let av = sort == .high ? a.element.high! : a.element.d!, bv = sort == .high ? b.element.high! : b.element.d!
-                return av == bv ? a.offset < b.offset : av < bv
-            }.map(\.element) + unavailable
-        }
+        let available = values.filter(\.eligible)
         var output: [MatchPresentation] = []
-        for group in Set(available.map(\.comparisonGroup)).sorted() {
-            var remaining = available.filter { $0.comparisonGroup == group }
-            func bucket(_ value: Double) -> Double { (value / 0.5).rounded() }
-            while !remaining.isEmpty {
-                let front = remaining.filter { candidate in
-                    !remaining.contains { other in
-                        guard other.id != candidate.id else { return false }
-                        let d0 = bucket(other.d!), d1 = bucket(candidate.d!)
-                        if let h0 = other.high, let h1 = candidate.high { return d0 <= d1 && bucket(h0) <= bucket(h1) && (d0 < d1 || bucket(h0) < bucket(h1)) }
-                        return d0 < d1
+        let groups = Dictionary(grouping: available, by: \.comparisonGroup)
+        for groupID in groups.keys.sorted() {
+            let group = groups[groupID] ?? []
+            let sorted = group.enumerated().sorted { left, right in
+                let leftValue: Double?
+                let rightValue: Double?
+                let ascending: Bool
+                if mode == .song {
+                    leftValue = left.element.d
+                    rightValue = right.element.d
+                    ascending = true
+                } else {
+                    switch sort {
+                    case .character:
+                        leftValue = left.element.c
+                        rightValue = right.element.c
+                        ascending = false
+                    case .balanced:
+                        leftValue = left.element.d
+                        rightValue = right.element.d
+                        ascending = true
+                    case .high:
+                        leftValue = left.element.high
+                        rightValue = right.element.high
+                        ascending = true
                     }
-                }.sorted { a, b in a.d == b.d ? a.id < b.id : a.d! < b.d! }
-                output += front
-                let ids = Set(front.map(\.id)); remaining.removeAll { ids.contains($0.id) }
-            }
+                }
+                switch (leftValue, rightValue) {
+                case let (left?, right?):
+                    if left != right { return ascending ? left < right : left > right }
+                case (nil, nil):
+                    break
+                case (nil, _?):
+                    return false
+                case (_?, nil):
+                    return true
+                }
+                return left.element.id == right.element.id ? left.offset < right.offset : left.element.id < right.element.id
+            }.map(\.element)
+            output.append(contentsOf: sorted)
         }
         return output + unavailable
     }

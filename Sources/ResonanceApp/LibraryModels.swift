@@ -52,6 +52,7 @@ struct TrackEntry: Codable, Identifiable, Hashable {
     var sourcePlaylistID: UUID?
     var sourceOrder: Int = 0
     var error: String?
+    var analysisNotes: [String]?
     var comparisonAllowed = true
     var mediaStartSeconds: Double?
     var wallClockStartedAt: Date?
@@ -59,7 +60,7 @@ struct TrackEntry: Codable, Identifiable, Hashable {
     var droppedFrames: UInt64?
     var sourceProcessID: Int32?
     var analyzed: Bool { featurePath != nil }
-    var coverageLabel: String { audioPath == nil ? "仅歌曲信息" : (isFull ? "整曲" : "片段") }
+    var coverageLabel: String { audioPath == nil ? "仅歌曲信息" : (isFull ? "完整文件" : "已采 \(durationLabel(capturedSeconds))") }
 }
 
 struct PlaylistEntry: Codable, Identifiable, Hashable {
@@ -86,7 +87,6 @@ struct MatchPresentation: Identifiable {
     var bands: [BandPresentation]
     var evaluatedMin: Double?
     var evaluatedMax: Double?
-    var advantage: Double?
     var comparisonGroup = ""
     var eligible: Bool { d != nil }
 }
@@ -105,9 +105,9 @@ struct BandPresentation: Identifiable {
 }
 
 enum SongSort: String, CaseIterable, Identifiable {
-    case character = "特色探索"
-    case balanced = "综合适配"
-    case high = "超高频适配"
+    case character = "谱形变化"
+    case balanced = "参考偏差 D"
+    case high = "10–20k 偏差"
     var id: String { rawValue }
 }
 

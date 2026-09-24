@@ -8,8 +8,9 @@ struct LibraryScreen: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 26) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 8) { Text("声学资料库").font(.system(size: 27, weight: .medium)); Text("每条曲线都有来源，每次计算可以复核。").font(.callout).foregroundStyle(Palette.muted) }
+                    VStack(alignment: .leading, spacing: 8) { Text("声学资料库").font(.system(size: 27, weight: .medium)); Text("保存你的耳机曲线、参考和歌曲。").font(.callout).foregroundStyle(Palette.muted) }
                     Spacer()
+                    Button("使用拉斐尔示例") { model.loadRaphaelSample() }
                     Button("导入曲线") { model.chooseCurveFile() }
                     Button("数据目录", systemImage: "folder") { model.revealData() }
                 }
@@ -38,7 +39,7 @@ struct LibraryScreen: View {
                             let low = floor((values.min() ?? -30) / 10) * 10 - 5
                             let high = ceil((values.max() ?? 30) / 10) * 10 + 5
                             FrequencyPlot(lines: [PlotLine(id: "headphone", values: Array(zip(curve.frequencies, curve.levels)), color: Palette.accent)] + (ref.map { [PlotLine(id: "reference", values: Array(zip($0.frequencies, $0.levels)), color: .orange)] } ?? []), minDB: low, maxDB: max(low + 10, high)).frame(height: 190)
-                            Text("原始数值（dB）· 绿色：实测；橙色：参考。图示位置不代表适配排名。").font(.caption2).foregroundStyle(Palette.muted)
+                            Text("绿色：耳机实测；橙色：所选参考。").font(.caption2).foregroundStyle(Palette.muted)
                             Text(curve.notes).font(.caption).foregroundStyle(Palette.muted).textSelection(.enabled)
                             Text(curve.source).font(.caption2).foregroundStyle(Palette.muted).lineLimit(2).textSelection(.enabled)
                         }
@@ -48,7 +49,7 @@ struct LibraryScreen: View {
                 ForEach(model.references) { reference in
                     HStack { Image(systemName: "scope").foregroundStyle(.orange); Text(reference.name); Spacer(); Text(reference.measurementSystem.isEmpty ? "体系未确认" : reference.measurementSystem).foregroundStyle(Palette.muted) }.font(.callout).padding(14).background(Palette.panel, in: RoundedRectangle(cornerRadius: 8))
                 }
-                if model.references.isEmpty { Text("导入参考文件时选择“参考目标”。只允许与相同测量体系的耳机曲线共同计算。").font(.callout).foregroundStyle(Palette.muted) }
+                if model.references.isEmpty { Text("导入你想比较的参考曲线。拉斐尔示例附带平直计算基线，可随时更换。").font(.callout).foregroundStyle(Palette.muted) }
                 SectionCaption(title: "录音与来源", trailing: "\(model.tracks.count) ITEMS")
                 ForEach(model.tracks) { track in TrackLibraryRow(track: track) }
             }.padding(30)
@@ -90,6 +91,9 @@ struct TrackLibraryRow: View {
                 } else { Text("歌单原始行的歌曲 ID 保持不变；请通过“用于歌单曲目”关联对应录音。").font(.caption).foregroundStyle(.orange) }
                 Text("这是你对录音版本的手动绑定，不会把同名歌曲自动合并。").font(.caption2).foregroundStyle(Palette.muted)
             }
+            if let notes = track.analysisNotes, !notes.isEmpty {
+                Text(notes.joined(separator: "；")).font(.caption).foregroundStyle(Palette.muted)
+            }
             if let error = track.error { Text(error).font(.caption).foregroundStyle(.orange) }
         }.padding(15).background(Palette.panel, in: RoundedRectangle(cornerRadius: 8))
             .sheet(isPresented: $showPlaylistBinding) { RecordingBindingView(recording: track).environmentObject(model) }
@@ -112,10 +116,10 @@ struct CurveImportSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("保存数值曲线").font(.title2.weight(.medium))
-            Text("\(draft.frequencies.count) 个测量点 · 有效频段请按测量来源填写，不能仅以图表横轴推定。").font(.callout).foregroundStyle(Palette.muted)
+            Text("\(draft.frequencies.count) 个测量点 · 下方可补充测量信息。").font(.callout).foregroundStyle(Palette.muted)
             Form {
                 TextField("名称", text: $name)
-                TextField("测量体系 / 耦合器", text: $system, prompt: Text("未知可留空，但暂不参与匹配"))
+                TextField("测量体系 / 耦合器", text: $system, prompt: Text("选填，例如测量设备或来源站点"))
                 HStack { TextField("有效下限 Hz", text: $minimum); TextField("有效上限 Hz", text: $maximum) }
                 Toggle("这是参考目标曲线", isOn: $reference)
                 if !reference { Toggle("我拥有这副耳机", isOn: $owned) }

@@ -46,9 +46,6 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
 
 struct MainView: View {
     @EnvironmentObject var model: AppModel
-    @State private var showPlaylistExport = false
-    @State private var playlistPreview: WebWorkspace.PlaylistWritePreview?
-    @State private var playlistWriteResult: WebWorkspace.PlaylistWriteResult?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -64,7 +61,7 @@ struct MainView: View {
                     else { Circle().fill(Palette.accent.opacity(0.7)).frame(width: 5, height: 5) }
                     Text(model.status).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(2)
                     Spacer()
-                    Text("LOCAL AUDIO · NO SEMANTIC RANKING").font(.system(size: 9, design: .monospaced)).foregroundStyle(Palette.muted.opacity(0.55))
+                    Text("LOCAL AUDIO").font(.system(size: 9, design: .monospaced)).foregroundStyle(Palette.muted.opacity(0.55))
                 }.padding(.horizontal, 24).frame(height: 44)
             }
         }
@@ -72,18 +69,6 @@ struct MainView: View {
         .tint(Palette.accent)
         .sheet(isPresented: $model.showCurveImport) {
             if let draft = model.curveDraft { CurveImportSheet(draft: draft).environmentObject(model) }
-        }
-        .sheet(isPresented: $showPlaylistExport) {
-            PlaylistExportView(
-                model: model,
-                preview: $playlistPreview,
-                result: $playlistWriteResult,
-                openBrowser: {
-                    if let source = playlistPreview?.sourceURL {
-                        model.openWebsite(source.absoluteString)
-                    }
-                }
-            )
         }
         .alert("需要处理", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("知道了") { model.errorMessage = nil }
@@ -94,12 +79,7 @@ struct MainView: View {
         .onChange(of: model.selectedPlaylistID) { _, _ in model.recompute() }
         .onChange(of: model.sort) { _, _ in model.recompute() }
         .onChange(of: model.includePartial) { _, _ in model.recompute() }
-        .onChange(of: model.exportRevision) { _, _ in
-            if !showPlaylistExport {
-                playlistPreview = nil
-                playlistWriteResult = nil
-            }
-        }
+
     }
 
     private var sidebar: some View {
@@ -130,7 +110,7 @@ struct MainView: View {
                 )).toggleStyle(.switch).font(.system(size: 11))
                 Text(model.automaticListeningEnabled ? model.automaticListeningStatus : "已关闭 · 下次启动保留此选择")
                     .font(.system(size: 10)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                Text("持续采集播放内容 · 覆盖不足标为片段")
+                Text("连续录音 · 数据留在本机")
                     .font(.system(size: 9)).foregroundStyle(Palette.muted)
             }.padding(.bottom, 20)
             VStack(alignment: .leading, spacing: 12) {
@@ -155,6 +135,17 @@ struct MainView: View {
                     Button("导入音频", systemImage: "arrow.down.document") { model.chooseAudioFiles() }.disabled(model.busy)
                     Button("导入频响", systemImage: "waveform.path") { model.chooseCurveFile() }
                 }.buttonStyle(.bordered).padding(.bottom, 4)
+                if model.headphones.isEmpty {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("先算一首试试").font(.headline)
+                            Text("加载拉斐尔曲线，再导入音频或录一段歌。参考可以随时更换。")
+                                .font(.callout).foregroundStyle(Palette.muted)
+                        }
+                        Spacer()
+                        Button("使用拉斐尔示例") { model.loadRaphaelSample() }.buttonStyle(.borderedProminent)
+                    }.padding(18).background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
+                }
                 PlaybackPanel()
                 if model.mode == .song { songSelection } else { headphoneSelection }
                 HStack(alignment: .top, spacing: 20) {
@@ -208,32 +199,31 @@ struct MainView: View {
             HStack {
                 Picker("排序", selection: $model.sort) { ForEach(SongSort.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).frame(maxWidth: 380)
                 Spacer()
-                Toggle("允许片段结果", isOn: $model.includePartial).toggleStyle(.checkbox).font(.system(size: 11))
-                Button("写入网易云…") { showPlaylistExport = true }.disabled(model.results.filter(\.eligible).isEmpty)
-                Button("本地 JSON…") { model.exportCandidatePlaylist() }.disabled(model.results.filter(\.eligible).isEmpty)
+                Toggle("包含采集片段", isOn: $model.includePartial).toggleStyle(.checkbox).font(.system(size: 11))
+                Button("导出结果…") { model.exportCandidatePlaylist() }.disabled(model.results.filter(\.eligible).isEmpty)
             }
         }.padding(18).background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
     }
 
     private var resultsPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionCaption(title: model.mode == .song ? "已有耳机 · 适配明细" : "候选歌曲", trailing: "\(model.results.count) RESULTS")
+            SectionCaption(title: model.mode == .song ? "耳机与这首歌" : "候选歌曲", trailing: "\(model.results.count) RESULTS")
             if model.mode == .song && Set(model.results.filter(\.eligible).map(\.comparisonGroup)).count > 1 {
-                Text("存在不同参考 / 测量体系，以下各组独立比较，组间顺序不代表优劣。").font(.caption).foregroundStyle(.orange)
+                Text("结果按参考和实际频段分组。").font(.caption).foregroundStyle(.orange)
             }
             if model.results.isEmpty {
-                EmptyPanel(icon: model.mode.icon, title: model.mode == .song ? "从你的耳机开始" : "等待真实音频", detail: model.mode == .song ? "在资料库导入实测频响和兼容的参考曲线。缺少依据时，结果会明确显示不可评估。" : "选择耳机与候选歌曲，已采集的真实录音才能参与匹配。")
+                EmptyPanel(icon: model.mode.icon, title: model.mode == .song ? "从你的耳机开始" : "等待真实音频", detail: model.mode == .song ? "加载耳机曲线，选一个参考，再选一首音频。" : "选择耳机，再导入或采集你想比较的歌曲。")
             } else {
                 ForEach(Array(model.results.enumerated()), id: \.element.id) { index, result in
                     if model.mode == .song && result.eligible && (index == 0 || model.results[index - 1].comparisonGroup != result.comparisonGroup) {
-                        Text("独立比较组 · \(result.subtitle)").font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.accent).padding(.top, 10)
+                        Text(result.subtitle).font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.accent).padding(.top, 10)
                     }
                     Button { model.selectedResultID = result.id } label: {
                         VStack(alignment: .leading, spacing: 9) {
                             HStack { Text(result.name).font(.system(size: 13, weight: .medium)).lineLimit(1); Spacer(); Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(Palette.muted) }
                             Text(result.subtitle).font(.system(size: 10)).foregroundStyle(Palette.muted).lineLimit(2)
                             if result.eligible {
-                                HStack { metric("综合", result.d); metric("10–20k", result.high); if model.mode == .headphone && model.sort == .character { metric("变化", result.c, digits: 3) } }
+                                HStack { metric("D", result.d); metric("高频偏差", result.high); if model.mode == .headphone && model.sort == .character { metric("变化", result.c, digits: 3) } }
                             } else { Text(result.reason).font(.system(size: 10)).foregroundStyle(.orange.opacity(0.9)).lineLimit(3) }
                         }.padding(15).frame(maxWidth: .infinity, alignment: .leading)
                             .background(model.selectedResult?.id == result.id ? Palette.accent.opacity(0.08) : Palette.panel, in: RoundedRectangle(cornerRadius: 9))
@@ -244,13 +234,13 @@ struct MainView: View {
         }
     }
 
-    private func metric(_ label: String, _ value: Double?, digits: Int = 2) -> some View {
+    private func metric(_ label: String, _ value: Double?, digits: Int = 1) -> some View {
         HStack(spacing: 4) { Text(label).foregroundStyle(Palette.muted); Text(value.map { String(format: "%.*f", digits, $0) } ?? "—").foregroundStyle(.white) }.font(.system(size: 10, design: .monospaced)).padding(.trailing, 6)
     }
 
     private var detailPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SectionCaption(title: "声学证据", trailing: "20 Hz → 有效带宽")
+            SectionCaption(title: "这首歌的频段表现", trailing: "频响 × 歌曲能量")
             if !model.spectrumLine.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("歌曲平均功率谱 · dB/Hz（数字域）").font(.system(size: 10)).foregroundStyle(Palette.muted)
@@ -258,10 +248,17 @@ struct MainView: View {
                 }
             }
             if let result = model.selectedResult {
+                if let d = result.d {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(String(format: "%.1f dB", d)).font(.system(size: 32, weight: .medium, design: .rounded))
+                        Text("参考偏差 D").font(.callout).foregroundStyle(Palette.muted)
+                    }
+                    Text("越小越接近所选参考；不是音质打分。").font(.caption).foregroundStyle(Palette.muted)
+                }
                 Text(result.reason).font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
                 if !result.bands.isEmpty { bandTable(result.bands) }
             } else {
-                EmptyPanel(icon: "chart.xyaxis.line", title: "每个结论，都有频段依据", detail: "这里展示歌曲真实能量、耳机响应变化和超高频明细。没有数据时不生成听感描述。")
+                EmptyPanel(icon: "chart.xyaxis.line", title: "选一首歌，看看哪里突出", detail: "这里会显示歌曲的能量分布，以及耳机相对参考的变化。")
             }
         }.padding(18).background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
     }

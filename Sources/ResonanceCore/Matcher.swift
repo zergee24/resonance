@@ -48,7 +48,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .missingHeadphoneCurve,
-                message: "No headphone measurement curve is available."
+                message: "缺少耳机实测曲线，暂时不能计算。"
             )
         }
         guard let reference else {
@@ -57,25 +57,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: nil,
                 reason: .missingReference,
-                message: "An applicable reference response is required."
-            )
-        }
-        guard let referenceID = headphone.referenceID, referenceID == reference.id, reference.isReference else {
-            return unevaluable(
-                features: features,
-                headphone: headphone,
-                reference: reference,
-                reason: .missingReference,
-                message: "The supplied reference does not match the headphone configuration."
-            )
-        }
-        guard features.coverage.isUsable else {
-            return unevaluable(
-                features: features,
-                headphone: headphone,
-                reference: reference,
-                reason: .missingCoverage,
-                message: "The recording has no usable complete or partial coverage."
+                message: "请先选择参考曲线，暂时不能计算。"
             )
         }
         guard !features.frames.isEmpty else {
@@ -84,7 +66,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .noSpectrumFrames,
-                message: "No spectrum frames are available."
+                message: "没有可用的频谱帧，暂时不能计算。"
             )
         }
         guard features.frequencyBinsHz.count >= 2,
@@ -92,14 +74,17 @@ public struct Matcher: Sendable {
               zip(features.frequencyBinsHz, features.frequencyBinsHz.dropFirst()).allSatisfy({ $0.0 < $0.1 }),
               features.frames.allSatisfy({ frame in
                   frame.powerSpectralDensityByChannel.count == features.channelCount
-                      && frame.powerSpectralDensityByChannel.allSatisfy { $0.count == features.frequencyBinsHz.count }
+                      && frame.powerSpectralDensityByChannel.allSatisfy {
+                          $0.count == features.frequencyBinsHz.count
+                              && $0.allSatisfy(\.isFinite)
+                      }
               }) else {
             return unevaluable(
                 features: features,
                 headphone: headphone,
                 reference: reference,
                 reason: .invalidInput,
-                message: "The spectrum frequency axis and per-channel PSD shapes are inconsistent."
+                message: "频率轴或各声道 PSD 形状不一致，暂时不能计算。"
             )
         }
 
@@ -112,8 +97,8 @@ public struct Matcher: Sendable {
     }
 
     /// Convenience overload for adapters that keep a curve independently of
-    /// the persistence model. The reference and IDs remain explicit so an
-    /// accidental reference mismatch cannot produce a score.
+    /// the persistence model. The explicit reference is the algorithm input;
+    /// the persistence model's optional reference ID is not a second gate.
     public func match(
         features: SpectrumFeatures,
         headphoneID: UUID,
@@ -147,7 +132,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .noCommonFrequencyCoverage,
-                message: "The audio, headphone, and reference curves have no common frequency coverage."
+                message: "音频、耳机曲线与参考曲线没有共同频段，暂时不能计算。"
             )
         }
 
@@ -162,7 +147,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .noCommonFrequencyCoverage,
-                message: "The audio, headphone, and reference curves have no common detail coverage."
+                message: "音频与两条曲线没有共同的明细频段，暂时不能计算。"
             )
         }
 
@@ -176,7 +161,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .insufficientResolution,
-                message: "The spectrum has fewer than two bins in the common frequency range."
+                message: "共同频段的频谱分辨率不足，暂时不能计算。"
             )
         }
 
@@ -190,7 +175,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .insufficientResolution,
-                message: "The spectrum has fewer than two bins in the common detail range."
+                message: "共同明细频段的频谱分辨率不足，暂时不能计算。"
             )
         }
 
@@ -206,7 +191,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .noCommonFrequencyCoverage,
-                message: "A curve value could not be interpolated across the common frequency range."
+                message: "共同频段内无法从曲线取得完整数值，暂时不能计算。"
             )
         }
         guard let detailDeltas = deltaValues(
@@ -221,7 +206,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .noCommonFrequencyCoverage,
-                message: "A curve value could not be interpolated across the common detail range."
+                message: "共同明细频段内无法从曲线取得完整数值，暂时不能计算。"
             )
         }
 
@@ -301,7 +286,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .noSpectrumFrames,
-                message: "The common frequency range contains no finite non-zero audio energy."
+                message: "共同频段没有有限且非零的音频能量，暂时不能计算。"
             )
         }
 
@@ -356,11 +341,21 @@ public struct Matcher: Sendable {
             commonMaximum: detailMaximum
         )
 
+        let evaluationStatus: MatchEvaluationStatus = features.coverage.kind == .complete && !features.coverage.hasUnexplainedGaps
+            ? .evaluated
+            : .partial
+        let coverageMessage = evaluationMessage(
+            features: features,
+            minimumHz: minimum,
+            maximumHz: maximum
+        )
+
         return MatchResult(
             recordingID: features.recordingID,
             headphoneID: headphone.id,
             referenceID: reference.id,
-            status: features.coverage.kind == .complete && !features.coverage.hasUnexplainedGaps ? .evaluated : .partial,
+            status: evaluationStatus,
+            message: coverageMessage,
             c: c,
             d: d,
             dHigh: dHigh,
@@ -372,6 +367,50 @@ public struct Matcher: Sendable {
             frequencyBands: evidence,
             modelVersion: configuration.modelVersion
         )
+    }
+
+    private func evaluationMessage(
+        features: SpectrumFeatures,
+        minimumHz: Double,
+        maximumHz: Double
+    ) -> String {
+        let recordedSeconds = features.coverage.recordedDurationSeconds ?? features.durationSeconds
+        let secondsText: String
+        if recordedSeconds.isFinite, recordedSeconds >= 0 {
+            secondsText = String(format: "%.1f", recordedSeconds)
+        } else {
+            secondsText = "未知"
+        }
+
+        var parts = [
+            "按已采 \(secondsText) 秒内容估计",
+            "实际计算 \(formatFrequency(minimumHz))–\(formatFrequency(maximumHz)) Hz"
+        ]
+        if features.coverage.hasUnexplainedGaps {
+            parts.append("发现未解释缺口，缺口未按静音补入")
+        }
+        switch features.coverage.kind {
+        case .complete:
+            break
+        case .partial:
+            parts.append("覆盖不完整")
+        case .unknown:
+            parts.append("覆盖范围未知")
+        case .unavailable:
+            parts.append("覆盖信息不可用")
+        }
+        if !features.coverage.identityConfirmed {
+            parts.append("歌曲身份或播放位置尚未完全核实")
+        }
+        return parts.joined(separator: "；") + "。"
+    }
+
+    private func formatFrequency(_ frequencyHz: Double) -> String {
+        guard frequencyHz.isFinite else { return "未知" }
+        if frequencyHz >= 1_000 {
+            return String(format: "%.4gk", frequencyHz / 1_000)
+        }
+        return String(format: "%.4g", frequencyHz)
     }
 
     private func unevaluable(

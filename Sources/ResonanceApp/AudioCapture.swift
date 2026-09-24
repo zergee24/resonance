@@ -554,10 +554,7 @@ private final class CaptureSession {
                 kAudioAggregateDeviceTapListKey: [[
                     kAudioSubTapUIDKey: tapUID,
                     kAudioSubTapDriftCompensationKey: 0
-                ]],
-                // Do not wait for a physical output device. The tap itself is
-                // the input source and the aggregate remains private.
-                kAudioAggregateDeviceTapAutoStartKey: 1
+                ]]
             ]
             NSLog(
                 "[ResonanceApp.AudioCapture] create aggregate uid=%@ tapID=%u tapUID=%@",

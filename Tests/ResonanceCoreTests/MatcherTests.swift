@@ -27,20 +27,24 @@ final class MatcherTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(result.c), 0, accuracy: 1e-12)
     }
 
-    func testMissingReferenceAndCoverageCannotBeEvaluated() throws {
+    func testMissingReferenceHasNoNumbersAndUnknownCoverageIsPartial() throws {
         let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
         let headphoneCurve = try makeCurve(name: "headphone", values: [2, 0, -2])
         let headphone = Headphone(name: "headphone", owned: true, curve: headphoneCurve, referenceID: reference.id)
         let missingReference = Matcher().match(features: try makeFeatures(coverage: .complete), headphone: headphone, reference: nil)
         XCTAssertEqual(missingReference.status, .unevaluable)
         XCTAssertEqual(missingReference.unevaluableReason, .missingReference)
+        XCTAssertNil(missingReference.c)
+        XCTAssertNil(missingReference.d)
 
         let uncovered = Matcher().match(features: try makeFeatures(coverage: .unknown), headphone: headphone, reference: reference)
-        XCTAssertEqual(uncovered.status, .unevaluable)
-        XCTAssertEqual(uncovered.unevaluableReason, .missingCoverage)
+        XCTAssertEqual(uncovered.status, .partial)
+        XCTAssertNotNil(uncovered.c)
+        XCTAssertNotNil(uncovered.d)
+        XCTAssertTrue(uncovered.message?.contains("覆盖范围未知") == true)
     }
 
-    func testRecordedOnlyPartialCoverageIsUsableButUnknownAndGapsAreNot() throws {
+    func testPartialUnknownAndGappedCoverageUsesRecordedPSDWithoutFillingGaps() throws {
         let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
         let headphoneCurve = try makeCurve(name: "headphone", values: [0, 0, 0])
         let headphone = Headphone(name: "headphone", owned: true, curve: headphoneCurve, referenceID: reference.id)
@@ -52,11 +56,47 @@ final class MatcherTests: XCTestCase {
 
         let gaps = try makeFeatures(coverage: .partial, recordedDurationSeconds: 1, hasUnexplainedGaps: true)
         let gapResult = Matcher().match(features: gaps, headphone: headphone, reference: reference)
-        XCTAssertEqual(gapResult.status, .unevaluable)
-        XCTAssertEqual(gapResult.unevaluableReason, .missingCoverage)
+        XCTAssertEqual(gapResult.status, .partial)
+        XCTAssertNotNil(gapResult.d)
+        XCTAssertTrue(gapResult.message?.contains("缺口未按静音补入") == true)
+        XCTAssertEqual(try XCTUnwrap(gapResult.d), try XCTUnwrap(partialResult.d), accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(gapResult.c), try XCTUnwrap(partialResult.c), accuracy: 1e-12)
 
         let unknown = try makeFeatures(coverage: .unknown, recordedDurationSeconds: nil)
-        XCTAssertFalse(unknown.coverage.isUsable)
+        let unknownResult = Matcher().match(features: unknown, headphone: headphone, reference: reference)
+        XCTAssertEqual(unknownResult.status, .partial)
+        XCTAssertNotNil(unknownResult.d)
+    }
+
+    func testExplicitReferenceIsTheOnlyReferenceIdentityInput() throws {
+        let selectedReference = try makeCurve(name: "selected", values: [0, 0, 0], isReference: false)
+        let headphoneCurve = try makeCurve(name: "headphone", values: [2, 0, -2])
+        let headphone = Headphone(name: "headphone", owned: true, curve: headphoneCurve, referenceID: UUID())
+
+        let result = Matcher().match(
+            features: try makeFeatures(coverage: .complete),
+            headphone: headphone,
+            reference: selectedReference
+        )
+
+        XCTAssertTrue(result.isEvaluable)
+        XCTAssertNotNil(result.d)
+    }
+
+    func testNonFinitePSDIsRejected() throws {
+        let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
+        let headphoneCurve = try makeCurve(name: "headphone", values: [0, 0, 0])
+        let headphone = Headphone(name: "headphone", owned: true, curve: headphoneCurve, referenceID: reference.id)
+
+        let result = Matcher().match(
+            features: try makeFeatures(coverage: .complete, nonfinitePSD: true),
+            headphone: headphone,
+            reference: reference
+        )
+
+        XCTAssertEqual(result.status, .unevaluable)
+        XCTAssertEqual(result.unevaluableReason, .invalidInput)
+        XCTAssertNil(result.d)
     }
 
     func testHighFrequencyMetricRequiresContentAndFullCoverage() throws {
@@ -112,7 +152,8 @@ final class MatcherTests: XCTestCase {
         coverage: CoverageKind,
         frequencies: [Double] = [20, 1_000, 20_000],
         recordedDurationSeconds: Double? = nil,
-        hasUnexplainedGaps: Bool = false
+        hasUnexplainedGaps: Bool = false,
+        nonfinitePSD: Bool = false
     ) throws -> SpectrumFeatures {
         let coverageValue = try Coverage(
             kind: coverage,
@@ -120,8 +161,9 @@ final class MatcherTests: XCTestCase {
             intervals: coverage == .unknown || recordedDurationSeconds != nil ? [] : [TimeRange(startSeconds: 0, endSeconds: 1)],
             hasUnexplainedGaps: hasUnexplainedGaps
         )
-        let psd = frequencies.map { frequency in
-            frequency == 1_000 ? 1.0 : 0.2
+        let psd = frequencies.enumerated().map { index, frequency in
+            if nonfinitePSD && index == 0 { return Double.nan }
+            return frequency == 1_000 ? 1.0 : 0.2
         }
         let frame = SpectrumFrame(startTimeSeconds: 0, sampleCount: 1_024, powerSpectralDensityByChannel: [psd, psd])
         return SpectrumFeatures(

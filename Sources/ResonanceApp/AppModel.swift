@@ -15,8 +15,8 @@ final class AppModel: ObservableObject {
     @Published var selectedTrackID: UUID?
     @Published var selectedHeadphoneID: UUID?
     @Published var selectedPlaylistID: UUID?
-    @Published var sort: SongSort = .character
-    @Published var includePartial = false
+    @Published var sort: SongSort = .balanced
+    @Published var includePartial = true
     @Published var results: [MatchPresentation] = []
     @Published var selectedResultID: String?
     @Published var spectrumLine: [Double] = []
@@ -24,7 +24,6 @@ final class AppModel: ObservableObject {
     @Published var status = "导入曲线和歌曲，开始建立你的声学资料库。"
     @Published var busy = false
     @Published var matching = false
-    @Published var exportRevision = UUID()
     @Published var errorMessage: String?
     @Published var showLibrary = false
     @Published var showBrowser = false
@@ -43,7 +42,6 @@ final class AppModel: ObservableObject {
     var captureIsAutomatic = false
     var captureStartTask: Task<Void, Never>?
     var captureRequestID: UUID?
-    var lastConfirmedCaptureSnapshot: PlayerSnapshot?
     var isShuttingDown = false
     var capturedProcessingDeclaration = false
     var capturedProcessID: Int32?
@@ -138,7 +136,7 @@ final class AppModel: ObservableObject {
             defer { if analysisRevision == revision { busy = false } }
             for sourceURL in urls {
                 if Task.isCancelled { break }
-                var track = TrackEntry(title: sourceURL.deletingPathExtension().lastPathComponent, artist: "", processingState: "基于导入文件；不推断母带处理")
+                var track = TrackEntry(title: sourceURL.deletingPathExtension().lastPathComponent, artist: "", processingState: "本地音频文件")
                 let destination = database.directory.appendingPathComponent("Audio/\(track.id.uuidString).\(sourceURL.pathExtension)")
                 do {
                     status = "正在分析 · \(track.title)"

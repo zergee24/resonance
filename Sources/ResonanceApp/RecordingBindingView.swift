@@ -50,7 +50,7 @@ struct RecordingBindingView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text("确认录音归属").font(.title2.weight(.semibold))
-            Text("选择一个网易云歌单原始行，把这次真实录音的分析结果绑定回去。平台 ID 只用于核对，不会自动匹配其他行。")
+            Text("选择这段录音对应的歌曲，将分析结果加入歌单。")
                 .font(.callout)
                 .foregroundStyle(Palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
@@ -79,7 +79,6 @@ struct RecordingBindingView: View {
                         if let channels = recording.channels {
                             TinyBadge(text: "\(channels) 声道")
                         }
-                        TinyBadge(text: recording.comparisonAllowed ? "允许比较" : "限制比较", color: recording.comparisonAllowed ? Palette.accent : .orange)
                     }
                 }
                 Spacer(minLength: 0)
@@ -255,11 +254,12 @@ extension AppModel {
         target.droppedFrames = recording.droppedFrames
         target.sourceProcessID = recording.sourceProcessID
         target.error = recording.error
+        target.analysisNotes = recording.analysisNotes
 
         do {
             try saveTrack(target)
             selectedTrackID = target.id
-            status = "已将真实录音绑定到歌单原始行：\(target.title)；保留歌单行 ID 与原始顺序。"
+            status = "已关联歌曲：\(target.title)"
             recompute()
             return true
         } catch {

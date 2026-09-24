@@ -66,14 +66,9 @@ extension AppModel {
         // Keep the observer independent of the currently visible page. Losing
         // identity is a recording boundary even when no player event arrives.
         if snapshot == nil, captureIdentity != nil, capture.isRecording {
-            finishCapture(excludingUncertainTail: "播放器或歌曲身份不可用，末尾归属不明的音频已排除。")
+            finishCapture(boundaryNote: "歌曲身份不可用，按已录内容估计。")
         }
         if snapshot == nil, captureIdentity != nil, captureRequestID != nil { cancelCaptureStart() }
-        if let snapshot, capture.isRecording,
-           snapshot.candidateKey == captureIdentity?.candidateKey,
-           snapshot.playbackState == .playing {
-            lastConfirmedCaptureSnapshot = snapshot
-        }
         guard automaticListeningEnabled else { return }
         let usableIdentity = snapshot.flatMap { value -> PlayerSnapshot? in
             guard value.trackID != nil || !(value.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
@@ -103,7 +98,6 @@ extension AppModel {
                 sourceURL: snapshot.trackURL?.absoluteString, duration: snapshot.duration,
                 source: snapshot.isCandidate ? "自动听歌记录 · 候选身份" : "自动听歌记录"
             )
-            track.comparisonAllowed = false
             do {
                 try saveTrack(track)
                 automaticHistorySessionID = sessionID
@@ -130,7 +124,7 @@ extension AppModel {
             case .trackChanged(let snapshot):
                 if let original = self.captureIdentity, snapshot.candidateKey != original.candidateKey {
                     self.cancelCaptureStart()
-                    self.finishCapture(excludingUncertainTail: "检测到切歌；末尾归属不明的音频已排除。")
+                    self.finishCapture(boundaryNote: "可能含切换尾音，按已录内容估计。")
                 }
                 self.lastPlayerPosition = nil
                 if self.isFollowPlaying { self.selectedTrackID = nil }
@@ -138,7 +132,7 @@ extension AppModel {
                 if state != .playing {
                     self.cancelCaptureStart()
                     if state == .unknown {
-                        self.finishCapture(excludingUncertainTail: "播放状态无法确认，末尾音频按观察时间保守截除。")
+                        self.finishCapture(boundaryNote: "播放状态不明，可能含切换尾音，按已录内容估计。")
                     } else { self.finishCapture() }
                 }
             case .positionChanged(let current, _):
@@ -147,7 +141,7 @@ extension AppModel {
                         let elapsed = Date().timeIntervalSince(at)
                         if current < previous - 0.5 || current - previous > elapsed + 2 {
                             self.cancelCaptureStart()
-                            self.finishCapture(excludingUncertainTail: "检测到跳播；末尾归属不明的音频已排除，跳过区间未计为已采集。")
+                            self.finishCapture(boundaryNote: "可能含跳播尾音，按已录内容估计。")
                             self.automaticListeningPolicy.resetForDiscontinuity()
                         }
                     }
@@ -156,7 +150,7 @@ extension AppModel {
             case .metadataUpdated: break
             case .unavailable:
                 self.cancelCaptureStart()
-                self.finishCapture(excludingUncertainTail: "播放器或歌曲身份不可用，末尾归属不明的音频已排除。")
+                self.finishCapture(boundaryNote: "歌曲身份不可用，按已录内容估计。")
             }
             self.automaticListeningTick()
         }
