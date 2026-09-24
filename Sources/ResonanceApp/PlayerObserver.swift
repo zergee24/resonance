@@ -143,6 +143,9 @@ public enum PlayerObserverStatus: Equatable {
 }
 
 public enum PlayerObserverEvent: Equatable {
+    /// The player snapshot became unavailable (for example, the player
+    /// exited, its process changed, or accessibility access was lost).
+    case unavailable
     case trackChanged(PlayerSnapshot)
     case playbackStateChanged(PlayerPlaybackState)
     case positionChanged(currentTime: TimeInterval?, duration: TimeInterval?)
@@ -170,6 +173,13 @@ public final class PlayerObserver: ObservableObject {
 
     /// Called on the main actor after a meaningful accessible-UI change.
     public var eventHandler: ((PlayerObserverEvent) -> Void)?
+
+    /// The currently running player's PID, when it can be located.  This
+    /// uses the same bundle-ID and visible-name lookup as observation, so a
+    /// caller can resolve the recording target without starting polling.
+    public var processIdentifier: pid_t? {
+        locatePlayer()?.processIdentifier
+    }
 
     private let bundleIdentifiers: [String]
     private let pollingInterval: TimeInterval
@@ -216,7 +226,7 @@ public final class PlayerObserver: ObservableObject {
         screenCaptureFallbackEnabled = false
         screenCapturePermissionNeeded = false
         lastProcessIdentifier = nil
-        snapshot = nil
+        publishSnapshot(nil)
         permissionNeeded = false
         status = .idle
     }
@@ -890,34 +900,36 @@ public final class PlayerObserver: ObservableObject {
     }
 
     private func mergeOCR(_ ocr: OCRMetadata) {
-        let previous = snapshot
-        let title = ocr.title ?? previous?.title
-        let artist = ocr.artist ?? previous?.artist
-        let currentTime = ocr.currentTime ?? previous?.currentTime
-        let duration = ocr.duration ?? previous?.duration
-        let playbackState = ocr.playbackState == .unknown ? (previous?.playbackState ?? .unknown) : ocr.playbackState
-        var limitations = previous?.limitations ?? []
-        appendUnique("屏幕 OCR 仅提供候选曲目元数据", to: &limitations)
+        // OCR is a candidate source only.  It cannot establish that the
+        // current text belongs to the same platform track as the previous
+        // snapshot, so do not carry over any identity or partially
+        // recognised metadata from that snapshot.  In particular, retaining
+        // an old ID/URL while the OCR title changes would bind a new song to
+        // the old platform identity.
+        let title = ocr.title
+        let artist = ocr.artist
+        let currentTime = ocr.currentTime
+        let duration = ocr.duration
+        let playbackState = ocr.playbackState
+        var limitations: [String] = []
+        appendUnique("屏幕 OCR 仅提供候选曲目元数据，不能证明精确歌曲 ID/链接", to: &limitations)
         appendUnique("OCR 不能证明整曲覆盖，需通过 PCM 采集状态判断", to: &limitations)
         if title == nil { appendUnique("OCR 未识别到歌曲标题", to: &limitations) }
         if artist == nil { appendUnique("OCR 未识别到艺人信息", to: &limitations) }
         if currentTime == nil || duration == nil {
             appendUnique("OCR 未识别到完整播放进度或时长", to: &limitations)
         }
-        if previous?.trackID == nil && previous?.trackURL == nil {
-            appendUnique("未获得网易云歌曲 ID/链接，当前仍是候选曲目", to: &limitations)
-        }
 
         let next = PlayerSnapshot(
-            trackID: previous?.trackID,
-            trackURL: previous?.trackURL,
+            trackID: nil,
+            trackURL: nil,
             title: title,
             artist: artist,
-            album: previous?.album,
+            album: nil,
             currentTime: currentTime,
             duration: duration,
             playbackState: playbackState,
-            identityEvidence: previous?.identityEvidence ?? .candidate,
+            identityEvidence: .candidate,
             limitations: limitations
         )
         publishSnapshot(next)
@@ -964,10 +976,26 @@ public final class PlayerObserver: ObservableObject {
 
     private func publishSnapshot(_ next: PlayerSnapshot?) {
         let previous = snapshot
+
+        // PlayerSnapshot equality intentionally ignores observedAt so a
+        // polling tick with the same values does not emit an event.  Still
+        // publish the fresh observation time, which is used as evidence for
+        // capture coverage and process continuity.
+        if let next, previous == next {
+            snapshot = next
+            return
+        }
+
         guard previous != next else { return }
 
         snapshot = next
-        guard let next else { return }
+        guard let next else {
+            // A missing snapshot is meaningful to an active capture: it
+            // closes the old identity boundary when the player exits, its
+            // PID changes, or access disappears.
+            if previous != nil { emit(.unavailable) }
+            return
+        }
         guard let previous else {
             emit(.trackChanged(next))
             return

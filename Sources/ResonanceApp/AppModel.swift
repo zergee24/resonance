@@ -31,7 +31,20 @@ final class AppModel: ObservableObject {
     @Published var showCurveImport = false
     @Published var curveDraft: CurveDraft?
     @Published var isFollowPlaying = true
+    @Published var automaticListeningEnabled: Bool
+    @Published var automaticListeningStatus = "等待网易云播放"
     @Published var sharedProcessingDeclared = false
+    let preferences: UserDefaults
+    var automaticListeningPolicy = AutomaticListeningPolicy()
+    var automaticListeningTimer: Timer?
+    var automaticHistorySessionID: UUID?
+    var automaticHistoryTrackID: UUID?
+    var captureTrackID: UUID?
+    var captureIsAutomatic = false
+    var captureStartTask: Task<Void, Never>?
+    var captureRequestID: UUID?
+    var lastConfirmedCaptureSnapshot: PlayerSnapshot?
+    var isShuttingDown = false
     var capturedProcessingDeclaration = false
     var capturedProcessID: Int32?
 
@@ -44,9 +57,12 @@ final class AppModel: ObservableObject {
     var database: LocalStore?
     var matchTask: Task<Void, Never>?
     var analysisTask: Task<Void, Never>?
+    var analysisRevision: UUID?
     var disposables = Set<AnyCancellable>()
 
-    init() {
+    init(preferences: UserDefaults = .standard) {
+        self.preferences = preferences
+        automaticListeningEnabled = AutomaticListeningPreference.isEnabled(in: preferences)
         do {
             let db = try LocalStore()
             database = db
@@ -113,9 +129,13 @@ final class AppModel: ObservableObject {
 
     func analyzeFiles(_ urls: [URL]) {
         guard !busy, let database else { return }
+        let previousAnalysis = analysisTask
+        let revision = UUID()
+        analysisRevision = revision
         busy = true
         analysisTask = Task {
-            defer { busy = false }
+            await previousAnalysis?.value
+            defer { if analysisRevision == revision { busy = false } }
             for sourceURL in urls {
                 if Task.isCancelled { break }
                 var track = TrackEntry(title: sourceURL.deletingPathExtension().lastPathComponent, artist: "", processingState: "基于导入文件；不推断母带处理")

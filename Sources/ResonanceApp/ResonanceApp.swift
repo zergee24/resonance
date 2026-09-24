@@ -10,7 +10,12 @@ struct ResonanceApplication: App {
         WindowGroup("共鸣 · AI 歌单") {
             MainView().environmentObject(model).preferredColorScheme(.dark)
                 .frame(minWidth: 1100, minHeight: 720)
-                .onAppear { NSApplication.shared.setActivationPolicy(.regular); NSApplication.shared.activate(ignoringOtherApps: true) }
+                .onAppear {
+                    delegate.model = model
+                    model.startListeningServices()
+                    NSApplication.shared.setActivationPolicy(.regular)
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1280, height: 850)
@@ -23,8 +28,20 @@ struct ResonanceApplication: App {
     }
 }
 
+@MainActor
 final class ApplicationDelegate: NSObject, NSApplicationDelegate {
+    weak var model: AppModel?
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model else { return .terminateNow }
+        model.prepareToQuit()
+        Task { @MainActor in
+            await model.captureStartTask?.value
+            await model.analysisTask?.value
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 }
 
 struct MainView: View {
@@ -106,6 +123,16 @@ struct MainView: View {
             Button { model.showLibrary = true; model.showBrowser = false } label: { Label("我的声学资料库", systemImage: "square.stack.3d.up").font(.system(size: 12)).foregroundStyle(model.showLibrary ? Palette.accent : Palette.muted) }.buttonStyle(.plain)
             Button { model.openWebsite("https://huihifi.com/home") } label: { Label("查询耳机曲线", systemImage: "globe").font(.system(size: 12)).foregroundStyle(Palette.muted) }.buttonStyle(.plain).padding(.top, 19)
             Spacer()
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("自动积累听歌资料", isOn: Binding(
+                    get: { model.automaticListeningEnabled },
+                    set: { model.setAutomaticListeningEnabled($0) }
+                )).toggleStyle(.switch).font(.system(size: 11))
+                Text(model.automaticListeningEnabled ? model.automaticListeningStatus : "已关闭 · 下次启动保留此选择")
+                    .font(.system(size: 10)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                Text("持续采集播放内容 · 覆盖不足标为片段")
+                    .font(.system(size: 9)).foregroundStyle(Palette.muted)
+            }.padding(.bottom, 20)
             VStack(alignment: .leading, spacing: 12) {
                 HStack { Text("已拥有耳机"); Spacer(); Text("\(model.headphones.filter(\.owned).count)").monospacedDigit().foregroundStyle(.white) }
                 HStack { Text("已分析录音"); Spacer(); Text("\(model.analyzedCount)").monospacedDigit().foregroundStyle(.white) }

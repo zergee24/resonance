@@ -19,6 +19,7 @@ public enum AudioCaptureStatus: Equatable {
 public enum AudioCaptureError: Error, LocalizedError, Equatable {
     case alreadyRecording
     case startInProgress
+    case startCancelled
     case startTimeout
     case invalidProcessID
     case processNotFound(pid_t)
@@ -39,6 +40,8 @@ public enum AudioCaptureError: Error, LocalizedError, Equatable {
             return "An audio capture is already running."
         case .startInProgress:
             return "An audio capture setup is already in progress."
+        case .startCancelled:
+            return "Audio capture setup was cancelled before it completed."
         case .startTimeout:
             return "Audio capture setup timed out while Core Audio was starting."
         case .invalidProcessID:
@@ -134,6 +137,9 @@ public final class AudioCapture: ObservableObject {
     @Published public private(set) var status: AudioCaptureStatus = .idle
     @Published public private(set) var meter: Float = 0
     @Published public private(set) var isRecording = false
+    /// Receives the summary when the meter detects a writer failure and stops
+    /// the session automatically. User-requested `stop()` does not call this.
+    public var onUnexpectedStop: ((CaptureSummary) -> Void)?
 
     private var session: CaptureSession?
     private var meterTimer: Timer?
@@ -142,6 +148,7 @@ public final class AudioCapture: ObservableObject {
         qos: .userInitiated
     )
     private var activeStartID: UUID?
+    private var pendingStartOperation: CaptureStartOperation?
 
     public init() {}
 
@@ -163,12 +170,22 @@ public final class AudioCapture: ObservableObject {
             destination: destination,
             setupQueue: setupQueue
         ) { [weak self] in
-            // A timeout never destroys a session from the timeout queue. The
-            // setup queue performs late cleanup, then releases this lease so a
-            // later start cannot overlap Core Audio object creation.
+            // Timeout and cancellation never destroy a session from the
+            // timeout queue. The setup queue performs late cleanup, then
+            // releases this lease so a later start cannot overlap Core Audio
+            // object creation.
             Task { @MainActor [weak self] in
                 guard let self, self.activeStartID == startID else { return }
                 self.activeStartID = nil
+            }
+        }
+        pendingStartOperation = operation
+        defer {
+            // Dropping this reference does not release activeStartID. A
+            // cancelled or timed-out setup still owns the start lease until
+            // its setup-queue cleanup callback runs.
+            if pendingStartOperation === operation {
+                pendingStartOperation = nil
             }
         }
 
@@ -185,15 +202,31 @@ public final class AudioCapture: ObservableObject {
             startMeterTimer()
         } catch {
             isRecording = false
-            status = .failed(error.localizedDescription)
+            if case AudioCaptureError.startCancelled = error {
+                status = .idle
+            } else {
+                status = .failed(error.localizedDescription)
+            }
             if case AudioCaptureError.startTimeout = error {
                 // Keep activeStartID until the setup queue has cleaned up a
                 // late Core Audio result. This rejects overlapping starts.
+            } else if case AudioCaptureError.startCancelled = error {
+                // Cancellation has the same late-cleanup lease as timeout.
             } else if activeStartID == startID {
                 activeStartID = nil
             }
             throw error
         }
+    }
+
+    /// Cancels a setup that is still waiting for Core Audio to start.
+    ///
+    /// This does not stop an already-recording session; call `stop()` for
+    /// that. The method returns immediately while any late Core Audio result
+    /// remains owned and cleaned up by the original setup queue.
+    public func cancelPendingStart() {
+        guard session == nil else { return }
+        pendingStartOperation?.cancel()
     }
 
     @discardableResult
@@ -229,7 +262,8 @@ public final class AudioCapture: ObservableObject {
                 }
                 self.meter = session.metrics.snapshot().peakLevel
                 if session.writerError != nil {
-                    _ = self.stop()
+                    guard let summary = self.stop() else { return }
+                    self.onUnexpectedStop?(summary)
                 }
             }
         }
@@ -246,25 +280,7 @@ public final class AudioCapture: ObservableObject {
 
 @available(macOS 14.2, *)
 private final class CaptureStartOperation {
-    private enum State {
-        case pending
-        case timedOut
-        case completed
-    }
-
-    private let pid: pid_t
-    private let destination: URL
-    private let setupQueue: DispatchQueue
-    private let timeoutQueue = DispatchQueue(
-        label: "com.resonance.audio-capture.timeout",
-        qos: .userInitiated
-    )
-    private let onLateCleanupFinished: () -> Void
-    private let stateLock = NSLock()
-    private var state: State = .pending
-    private var continuation: CheckedContinuation<CaptureSession, Error>?
-    private var timeoutTimer: DispatchSourceTimer?
-    private var launched = false
+    private let stateMachine: CaptureStartStateMachine<CaptureSession>
 
     init(
         pid: pid_t,
@@ -272,16 +288,77 @@ private final class CaptureStartOperation {
         setupQueue: DispatchQueue,
         onLateCleanupFinished: @escaping () -> Void
     ) {
-        self.pid = pid
-        self.destination = destination
-        self.setupQueue = setupQueue
-        self.onLateCleanupFinished = onLateCleanupFinished
+        stateMachine = CaptureStartStateMachine(
+            setupQueue: setupQueue,
+            timeout: .seconds(10),
+            setup: {
+                let session = try CaptureSession(pid: pid, destination: destination)
+                try session.start()
+                return session
+            },
+            cleanup: { session in
+                // This closure is called from the original setup queue after
+                // a blocking Core Audio call has returned.
+                _ = session.stop()
+            },
+            onLateCleanupFinished: onLateCleanupFinished
+        )
     }
 
     func run() async throws -> CaptureSession {
+        try await stateMachine.run()
+    }
+
+    func cancel() {
+        stateMachine.cancel()
+    }
+}
+
+/// Owns the await, timeout/cancellation state, and late cleanup for one setup
+/// operation. The generic result lets the probe exercise these races without
+/// constructing real Core Audio objects.
+@available(macOS 14.2, *)
+final class CaptureStartStateMachine<Value> {
+    private enum State {
+        case pending
+        case timedOut
+        case cancelled
+        case completed
+    }
+
+    private let setupQueue: DispatchQueue
+    private let timeoutInterval: DispatchTimeInterval
+    private let setup: () throws -> Value
+    private let cleanup: (Value) -> Void
+    private let onLateCleanupFinished: () -> Void
+    private let timeoutQueue = DispatchQueue(
+        label: "com.resonance.audio-capture.timeout",
+        qos: .userInitiated
+    )
+    private let stateLock = NSLock()
+    private var state: State = .pending
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var timeoutTimer: DispatchSourceTimer?
+    private var launched = false
+
+    init(
+        setupQueue: DispatchQueue,
+        timeout: DispatchTimeInterval,
+        setup: @escaping () throws -> Value,
+        cleanup: @escaping (Value) -> Void,
+        onLateCleanupFinished: @escaping () -> Void
+    ) {
+        self.setupQueue = setupQueue
+        self.timeoutInterval = timeout
+        self.setup = setup
+        self.cleanup = cleanup
+        self.onLateCleanupFinished = onLateCleanupFinished
+    }
+
+    func run() async throws -> Value {
         try await withCheckedThrowingContinuation { continuation in
             stateLock.lock()
-            precondition(!launched, "CaptureStartOperation.run() may only be called once")
+            precondition(!launched, "CaptureStartStateMachine.run() may only be called once")
             launched = true
             self.continuation = continuation
             stateLock.unlock()
@@ -290,16 +367,44 @@ private final class CaptureStartOperation {
         }
     }
 
+    func cancel() {
+        var continuationToResume: CheckedContinuation<Value, Error>?
+        stateLock.lock()
+        guard state == .pending else {
+            stateLock.unlock()
+            return
+        }
+        state = .cancelled
+        continuationToResume = continuation
+        continuation = nil
+        timeoutTimer?.cancel()
+        timeoutTimer = nil
+        stateLock.unlock()
+
+        // This only resolves the caller's await. The setup queue remains the
+        // owner of any Core Audio object that may still be inside setup.
+        continuationToResume?.resume(throwing: AudioCaptureError.startCancelled)
+    }
+
     private func schedule() {
         let timer = DispatchSource.makeTimerSource(queue: timeoutQueue)
         timer.setEventHandler { [weak self] in
             self?.timeout()
         }
-        timer.schedule(deadline: .now() + .seconds(10), leeway: .milliseconds(100))
-        timer.resume()
+        timer.schedule(deadline: .now() + timeoutInterval, leeway: .milliseconds(100))
 
         stateLock.lock()
-        timeoutTimer = timer
+        if state == .pending {
+            timeoutTimer = timer
+            // Balance the source's initial suspension while holding the state
+            // lock so cancellation cannot leave an unowned timer behind.
+            timer.resume()
+        } else {
+            // Dispatch sources must be resumed exactly once even when a
+            // concurrent cancellation wins before the timer is installed.
+            timer.resume()
+            timer.cancel()
+        }
         stateLock.unlock()
 
         // Core Audio setup, including AudioDeviceStart, is deliberately
@@ -311,16 +416,14 @@ private final class CaptureStartOperation {
 
     private func execute() {
         do {
-            let session = try CaptureSession(pid: pid, destination: destination)
-            try session.start()
-            finish(.success(session))
+            finish(.success(try setup()))
         } catch {
             finish(.failure(error))
         }
     }
 
     private func timeout() {
-        var continuationToResume: CheckedContinuation<CaptureSession, Error>?
+        var continuationToResume: CheckedContinuation<Value, Error>?
         stateLock.lock()
         guard state == .pending else {
             stateLock.unlock()
@@ -337,9 +440,9 @@ private final class CaptureStartOperation {
         continuationToResume?.resume(throwing: AudioCaptureError.startTimeout)
     }
 
-    private func finish(_ result: Result<CaptureSession, Error>) {
-        var continuationToResume: CheckedContinuation<CaptureSession, Error>?
-        var sessionToClean: CaptureSession?
+    private func finish(_ result: Result<Value, Error>) {
+        var continuationToResume: CheckedContinuation<Value, Error>?
+        var valueToClean: Value?
         var notifyLateCleanup = false
 
         stateLock.lock()
@@ -350,10 +453,10 @@ private final class CaptureStartOperation {
             continuation = nil
             timeoutTimer?.cancel()
             timeoutTimer = nil
-        case .timedOut:
+        case .timedOut, .cancelled:
             state = .completed
-            if case let .success(session) = result {
-                sessionToClean = session
+            if case let .success(value) = result {
+                valueToClean = value
             }
             timeoutTimer?.cancel()
             timeoutTimer = nil
@@ -364,10 +467,10 @@ private final class CaptureStartOperation {
         }
         stateLock.unlock()
 
-        if let sessionToClean {
+        if let valueToClean {
             // This is executed by the setup queue after the blocking start
             // call has returned, so teardown cannot race the HAL call.
-            _ = sessionToClean.stop()
+            cleanup(valueToClean)
         }
         if notifyLateCleanup {
             onLateCleanupFinished()

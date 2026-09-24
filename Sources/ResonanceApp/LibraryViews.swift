@@ -70,7 +70,7 @@ struct TrackLibraryRow: View {
                 Image(systemName: track.analyzed ? "waveform" : "clock").foregroundStyle(track.analyzed ? Palette.accent : .orange)
                 VStack(alignment: .leading) { Text(track.title).font(.callout); Text(track.artist.isEmpty ? track.source : track.artist).font(.caption).foregroundStyle(Palette.muted) }
                 Spacer()
-                TinyBadge(text: track.analyzed ? track.coverageLabel : "待采集")
+                TinyBadge(text: track.audioPath == nil ? "仅歌曲信息" : (track.analyzed ? track.coverageLabel : "音频待分析"))
                 if let id = track.neteaseID { TinyBadge(text: "网易云 \(id)") }
                 if track.analyzed && track.sourcePlaylistID == nil { Button("用于歌单曲目") { showPlaylistBinding = true }.font(.caption) }
                 Button(track.neteaseID == nil ? "绑定歌曲链接" : "查看绑定") { bindingURL = track.neteaseID.map { "https://music.163.com/song?id=\($0)" } ?? ""; identityConfirmed = false; showBinding.toggle() }.font(.caption)

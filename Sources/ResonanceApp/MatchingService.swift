@@ -47,7 +47,7 @@ extension AppModel {
                         for device in devices {
                             try Task.checkCancellation()
                             guard track.comparisonAllowed else {
-                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "采集处理状态未确认或存在丢帧；保留频谱，不生成通用耳机排名")); continue
+                                presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: track.error ?? "采集处理状态未确认或存在丢帧；保留频谱，不生成通用耳机排名")); continue
                             }
                             guard let measured = curveLibrary.first(where: { $0.id == device.curveID }) else {
                                 presentations.append(Self.unavailable(track: track, device: device, mode: currentMode, reason: "缺少实测曲线")); continue

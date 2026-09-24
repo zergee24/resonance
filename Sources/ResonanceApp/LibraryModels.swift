@@ -39,6 +39,7 @@ struct TrackEntry: Codable, Identifiable, Hashable {
     var neteaseID: String?
     var sourceURL: String?
     var audioPath: String?
+    var rawAudioPath: String?
     var featurePath: String?
     var duration: Double?
     var capturedSeconds: Double = 0
@@ -58,7 +59,7 @@ struct TrackEntry: Codable, Identifiable, Hashable {
     var droppedFrames: UInt64?
     var sourceProcessID: Int32?
     var analyzed: Bool { featurePath != nil }
-    var coverageLabel: String { isFull ? "整曲" : "片段" }
+    var coverageLabel: String { audioPath == nil ? "仅歌曲信息" : (isFull ? "整曲" : "片段") }
 }
 
 struct PlaylistEntry: Codable, Identifiable, Hashable {

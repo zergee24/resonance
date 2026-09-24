@@ -23,8 +23,32 @@ private struct CoreVerification {
         try verifyEnergyIntegration()
         try verifyExtendedBands()
         try verifyCAFDecode()
+        try verifyWholeTimeline()
 
         print("PASS all core assertions")
+    }
+
+    private static func verifyWholeTimeline() throws {
+        let sampleRate = 8_000.0
+        let seconds = 60.0
+        let tones = [500.0, 1_000.0, 2_000.0]
+        let samples: [Float] = (0..<Int(seconds * sampleRate)).map { index in
+            let part = min(2, index / Int(20 * sampleRate))
+            return Float(sin(2 * .pi * tones[part] * Double(index) / sampleRate))
+        }
+        let features = try SpectrumAnalyzer().analyze(samples: [samples], sampleRate: sampleRate)
+        try check(features.durationSeconds == seconds, "full timeline duration was truncated")
+        try check((features.frames.last?.startTimeSeconds ?? 0) > 59, "analysis must reach the final second")
+        let energies = tones.map { frequency in
+            let indices = features.frequencyBinsHz.indices.filter { abs(features.frequencyBinsHz[$0] - frequency) < 40 }
+            return features.frames.reduce(0.0) { total, frame in
+                total + indices.reduce(0.0) { $0 + frame.powerSpectralDensityByChannel[0][$1] }
+            }
+        }
+        let total = energies.reduce(0, +)
+        try check(total > 0 && energies.allSatisfy { $0 / total > 0.30 && $0 / total < 0.37 },
+                  "intro, middle and ending must all contribute to whole-recording features")
+        print("PASS whole timeline: 60 seconds, intro/middle/ending energy all represented; no 30-second truncation")
     }
 
     private static func verifyCurveImport(root: URL) throws {
