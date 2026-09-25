@@ -6,8 +6,8 @@
 <key>CFBundleDisplayName</key><string>共鸣 · AI 歌单</string>
 <key>CFBundleExecutable</key><string>Resonance</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.2.1</string>
-<key>CFBundleVersion</key><string>4</string>
+<key>CFBundleShortVersionString</key><string>0.2.2</string>
+<key>CFBundleVersion</key><string>5</string>
 <key>LSMinimumSystemVersion</key><string>14.2</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAudioCaptureUsageDescription</key><string>自动积累开启时，连续采集网易云播放的音频并在本机分析；你可以随时关闭。不会采集麦克风。</string>

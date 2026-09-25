@@ -23,7 +23,7 @@ struct PlaylistExportView: View {
                 Spacer()
                 Button("关闭") { dismiss() }.disabled(working)
             }
-            Text("选择歌曲并确认名称，应用会在当前登录的网易云账号下新建歌单。")
+            Text("选择歌曲并确认名称，应用会在网易云网页账号下新建歌单。桌面客户端用于听歌和采集，网页登录用于创建歌单。")
                 .font(.callout).foregroundStyle(Palette.muted)
             HStack(alignment: .top, spacing: 16) {
                 VStack(alignment: .leading, spacing: 10) {
@@ -77,7 +77,7 @@ struct PlaylistExportView: View {
             }
             if let error { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
             HStack {
-                Button("打开网易云 / 登录") { openPage(URL(string: "https://music.163.com/#/my/m/music/playlist")!) }
+                Button("连接网易云网页账号") { openPage(URL(string: "https://music.163.com/my/")!) }
                     .disabled(working)
                 Spacer()
                 if working { ProgressView().controlSize(.small); Text("正在创建并核对…").font(.caption) }

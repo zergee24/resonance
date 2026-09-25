@@ -8,7 +8,7 @@
   const pageWindow = pageDocument.defaultView || window;
 
   const visible = (element) => {
-    if (!element) return false;
+    if (!element || element.getClientRects().length === 0) return false;
     const style = (element.ownerDocument.defaultView || window).getComputedStyle(element);
     return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
   };
@@ -29,7 +29,7 @@
     const value = String(trackID || "");
     const roots = pageDocument === document ? [document] : [pageDocument, document];
     for (const root of roots) {
-      const control = Array.from(root.querySelectorAll('[data-res-action="addto"][data-res-id]'))
+      const control = Array.from(root.querySelectorAll('[data-res-action="fav"][data-res-id]'))
         .find((element) => element.getAttribute("data-res-id") === value && visible(element));
       if (control) return control;
     }
@@ -47,6 +47,7 @@
     // account for this write.
     const loggedInMarker = headerVisible(
       ".m-logged, .m-top-3 .user, .m-tophead .m-tlist a[href*='/user/'], " +
+      ".m-tophead .head a[href*='/user/home'], " +
       "a[href*='/user/home?id='], a[href*='/user?id='], [data-user-id], [data-uid]"
     );
     const loginControl = headerVisible(".login, .m-top-3 .login, a[href*='/login']");

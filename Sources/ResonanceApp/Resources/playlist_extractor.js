@@ -74,6 +74,14 @@
     }
     return null;
   };
+  const firstAttribute = (root, selectors, attribute) => {
+    for (const selector of selectors) {
+      const element = root.querySelector(selector);
+      const value = trim(element && element.getAttribute(attribute));
+      if (value) return value;
+    }
+    return null;
+  };
   const trackTitle = (row, link) => {
     const titleLink = row.querySelector("a[href*='/song?id='] b[title], a[href*='/song?id='][title], a[href*='/song/'] b[title]");
     const exactTitle = trim(titleLink && (titleLink.getAttribute("title") || titleLink.textContent));
@@ -113,10 +121,17 @@
     return null;
   };
 
+  // Keep playlist metadata and completeness evidence inside the playlist's
+  // main content. The page also renders recommendations, comments, and the
+  // user's sidebar in the same document; numbers in those areas are not the
+  // playlist's song count and headings there are not its name.
+  const playlistRoot = pageDocument.querySelector("#m-playlist, .m-playlist, .g-bd4") || pageDocument;
+  const trackRoot = playlistRoot.querySelector(".n-songtb, #song-list, .m-song-list") || playlistRoot;
+
   const rows = [];
   const seenRows = new Set();
   rowSelectors.forEach((selector) => {
-    pageDocument.querySelectorAll(selector).forEach((row) => {
+    trackRoot.querySelectorAll(selector).forEach((row) => {
       // Normalize nested selector hits to the actual table/list row. This
       // avoids treating a play/favorite control with data-res-id as a song.
       const canonical = row.closest("tr") || row.closest(".m-table-row") || row.closest("li") || row;
@@ -156,28 +171,45 @@
 
   rows.forEach((row) => append(row, songLinkIn(row)));
   if (tracks.length === 0) {
-    const links = Array.from(pageDocument.querySelectorAll("a[href*='/song?id='], a[href*='/song/'], a[data-song-id]"));
+    const links = Array.from(trackRoot.querySelectorAll("a[href*='/song?id='], a[href*='/song/'], a[data-song-id]"));
     links.forEach((link) => append(link, link));
   }
 
-  const bodyText = trim(pageDocument.body && pageDocument.body.innerText);
+  const countText = (value) => {
+    const text = trim(value);
+    if (!text) return null;
+    if (/^\d+$/.test(text)) return Number(text);
+    const patterns = [
+      /(?:^|[^\d])(\d+)\s*首(?:歌|歌曲)(?:$|[^\d])/i,
+      /(?:^|[^\d])(\d+)\s*songs?\b/i,
+      /(?:共|共有|total\s*[:：]?|songs?\s*[:：]?)\s*(\d+)\s*(?:首(?:歌|歌曲)|songs?)/i
+    ];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) return Number(match[1]);
+    }
+    return null;
+  };
   const countCandidates = [];
-  const countPatterns = [
-    /(?:共|共有|total\s*[:：]?|songs?\s*[:：]?)\s*(\d+)\s*(?:首|首歌曲|songs?)?/i,
-    /\((\d+)\s*(?:首|songs?)\)/i,
-    /(\d+)\s*首歌曲/i
-  ];
-  countPatterns.forEach((pattern) => {
-    const match = bodyText.match(pattern);
-    if (match) countCandidates.push(Number(match[1]));
+  const explicitCount = firstText(trackRoot, ["#playlist-track-count"]);
+  const countLabel = firstText(trackRoot, [".u-title .sub", ".n-songtb .sub"]);
+  [explicitCount, countLabel, trackRoot.innerText].forEach((value) => {
+    const count = countText(value);
+    if (count !== null) countCandidates.push(count);
   });
-  const totalCount = countCandidates.find((value) => Number.isSafeInteger(value) && value >= tracks.length) || null;
+  const totalCount = countCandidates.find((value) => Number.isSafeInteger(value) && value >= tracks.length) ?? null;
 
-  const scrollingElement = pageDocument.scrollingElement || pageDocument.documentElement;
-  const hasPagination = Boolean(pageDocument.querySelector(
+  const scrollingElement = trackRoot === pageDocument
+    ? (pageDocument.scrollingElement || pageDocument.documentElement)
+    : trackRoot;
+  const hasPagination = Boolean(trackRoot.querySelector(
     ".u-page, .m-pagination, [class*='pagination'], [aria-label*='下一页'], [aria-label*='next']"
   ));
-  const likelyVirtualized = Boolean(scrollingElement && scrollingElement.scrollHeight > scrollingElement.clientHeight * 1.5 && tracks.length > 0 && !totalCount);
+  const likelyVirtualized = Boolean(
+    scrollingElement && scrollingElement.clientHeight > 0 &&
+      scrollingElement.scrollHeight > scrollingElement.clientHeight * 1.5 &&
+      tracks.length > 0 && !totalCount
+  );
   let completeness = "notProven";
   let completenessReason = "页面未提供可核验的总曲目数，已读取行不能声明为完整歌单";
   if (totalCount !== null && totalCount === tracks.length && !hasPagination && !likelyVirtualized) {
@@ -194,9 +226,10 @@
   if (tracks.length === 0) warnings.push("当前页面 DOM 没有识别到带精确 ID 的歌曲行");
   if (tracks.some((track) => !track.url)) warnings.push("部分曲目没有可解析的链接");
 
-  const title = firstText(pageDocument, [
-    "meta[property='og:title']", ".g-crumb .f-cb", ".m-lycifo h2", ".u-cover + .cnt h2", "h1", "h2"
-  ]) || document.title || null;
+  const title = firstText(playlistRoot, [
+    ".m-info .cnt .cntc .hd .tit h2", ".m-info .tit h2", ".m-info h2", ".m-lycifo .cnt .tit h2"
+  ]) || firstAttribute(playlistRoot, ["#content-operation", "[data-res-name]"], "data-res-name") ||
+    firstText(playlistRoot, ["meta[property='og:title']"]);
   return {
     sourceURL: pageLocation,
     playlistID: playlistID(),

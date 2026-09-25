@@ -15,27 +15,41 @@ private struct AudioCaptureRealProbe {
 
     private static func run() async throws {
         guard CommandLine.arguments.count >= 2 else {
-            throw ProbeError("usage: AudioCaptureRealProbe <tone-probe-executable>")
+            throw ProbeError("usage: AudioCaptureRealProbe <tone-probe-executable> | --pid <pid>")
         }
-        let toneExecutable = URL(fileURLWithPath: CommandLine.arguments[1])
-        let child = Process()
-        child.executableURL = toneExecutable
-        child.arguments = ["--tone"]
-        try child.run()
+        let child: Process?
+        let targetPID: pid_t
+        if CommandLine.arguments[1] == "--pid" {
+            guard CommandLine.arguments.count >= 3,
+                  let parsedPID = Int32(CommandLine.arguments[2]),
+                  parsedPID > 0 else {
+                throw ProbeError("--pid requires a positive process ID")
+            }
+            child = nil
+            targetPID = pid_t(parsedPID)
+        } else {
+            let toneExecutable = URL(fileURLWithPath: CommandLine.arguments[1])
+            let toneProcess = Process()
+            toneProcess.executableURL = toneExecutable
+            toneProcess.arguments = ["--tone"]
+            try toneProcess.run()
+            child = toneProcess
+            targetPID = toneProcess.processIdentifier
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
         defer {
-            if child.isRunning {
+            if let child, child.isRunning {
                 child.terminate()
                 child.waitUntilExit()
             }
         }
-        try await Task.sleep(nanoseconds: 500_000_000)
 
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("resonance-audio-capture-\(UUID().uuidString).caf")
         let capture = await MainActor.run { AudioCapture() }
-        print("target: synthetic-tone pid=\(child.processIdentifier)")
+        print("target: pid=\(targetPID)")
         print("destination: \(destination.path)")
-        try await capture.start(pid: child.processIdentifier, destination: destination)
+        try await capture.start(pid: targetPID, destination: destination)
         print("start: status=recording")
         try await Task.sleep(nanoseconds: 2_000_000_000)
         guard let summary = await capture.stop() else {

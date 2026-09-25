@@ -145,12 +145,14 @@ final class PlaylistWriter {
             }
         }
 
-        try await web.ensurePageReady()
+        // NetEase inserts newly collected songs at the front of a playlist.
+        // Create with the last requested song, then add the rest in reverse.
+        let creationTrack = request.tracks[request.tracks.count - 1]
+        try await web.loadAndWait(url: creationTrack.url)
         try requireNetEasePage(web)
         try await requireLoggedInHeader()
 
-        let firstTrack = request.tracks[0]
-        let before = try await openPlaylistWindow(for: firstTrack)
+        let before = try await openPlaylistWindow(for: creationTrack)
         let beforeIDs = Set(before.items?.compactMap(\.id) ?? [])
 
         var newReceipt = receipt ?? Receipt(
@@ -209,7 +211,7 @@ final class PlaylistWriter {
 
         let created = try await findCreatedPlaylist(
             request: request,
-            firstTrack: firstTrack,
+            firstTrack: creationTrack,
             beforeIDs: beforeIDs
         )
         guard let createdID = created.id else {
@@ -246,10 +248,13 @@ final class PlaylistWriter {
             )
         }
 
-        for track in request.tracks {
+        for track in request.tracks.reversed() {
             if alreadyPresentIDs.contains(track.id) { continue }
             do {
                 _ = try await openPlaylistWindow(for: track)
+                _ = try await wait(operation: "listPlaylists", payload: WriterPayload(), timeout: 8) {
+                    $0.items?.contains(where: { $0.id == createdID }) == true
+                }
                 let selected = try await run(
                     operation: "selectTarget",
                     payload: WriterPayload(targetPlaylistID: createdID)
@@ -319,7 +324,9 @@ final class PlaylistWriter {
             )
         }
         _ = try await wait(operation: "modalState", payload: WriterPayload(), timeout: 8) { $0.visible == true }
-        let list = try await run(operation: "listPlaylists", payload: WriterPayload())
+        let list = try await wait(operation: "listPlaylists", payload: WriterPayload(), timeout: 8) {
+            $0.ok && $0.items?.isEmpty == false
+        }
         guard list.ok else {
             throw WebWorkspace.WebWorkspaceError.playlistWriteUnavailable(
                 list.message ?? "当前页面没有可核验的歌单选择窗口。"
@@ -371,7 +378,7 @@ final class PlaylistWriter {
     ) async throws -> WebWorkspace.PlaylistWriteResult {
         guard let web else { throw WebWorkspace.WebWorkspaceError.pageNotLoaded }
         let targetID = try Self.requirePlaylistID(in: targetURL)
-        try await web.loadAndWait(url: targetURL)
+        try await web.loadAndWait(url: Self.playlistURL(id: targetID))
         let extraction = try await web.extractPlaylist()
         guard extraction.playlistID == targetID else {
             throw WebWorkspace.WebWorkspaceError.playlistWriteUnavailable(
@@ -587,7 +594,9 @@ final class PlaylistWriter {
     }
 
     private static func playlistURL(id: String) -> URL {
-        URL(string: "https://music.163.com/#/playlist?id=\(id)")!
+        // Use the normal document URL so WKWebView performs a navigation.
+        // A hash-only route can render the target without firing didFinish.
+        URL(string: "https://music.163.com/playlist?id=\(id)")!
     }
 
     private static func isNetEaseHost(_ host: String?) -> Bool {
