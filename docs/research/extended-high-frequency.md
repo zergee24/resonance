@@ -202,3 +202,13 @@ sourceNoiseFloor / estimatedFloor（如可取得）
 - [AES5-2018 — PCM 采样频率建议](https://aes.org/publications/standards-store/?id=14)
 - [xMEMS 官方 MEMS 微型扬声器规格页](https://xmems.com/memsspeakers/)
 - [Infineon IM72D128V01 MEMS 麦克风数据手册](https://www.infineon.com/assets/row/public/documents/24/49/infineon-im72d128-datasheet-en.pdf)
+
+## 7. Harman 目标曲线在 20 kHz 以上的核验（2026-09-26）
+
+本次查到的 Harman 原作者/官方资料可以确认 Harman Target 是针对总体耳机音质偏好和参考扬声器音色建立的目标，但没有在可直接访问的资料中找到一条单独公开、经过验证并可直接用于耳机匹配的 Harman `>20 kHz` 数值目标表。Harman 的 Sean Olive 公开说明介绍了目标的来源与总体偏好用途，但没有给出超 20 kHz 的独立目标定义。[Harman / Sean Olive Q&A](https://news.harman.com/blog/samsung-x-akg-q-a-with-harmans-dr-sean-olive)
+
+有一篇 AES 原始论文在实验条件中把目标的 **full reproduction bandwidth** 设为 20 Hz–24 kHz，并把 Harman 与 flat 作为被比较的目标；这证明该研究曾在 20–24 kHz 的播放带宽中使用 Harman 目标进行实验，但“实验带宽到 24 kHz”不等于“公开了一个普适、经独立验证的 Harman 超 20 kHz 曲线”。[Engel et al., AES Journal 2022](https://secure.aes.org/forum/pubs/journal/?elib=21564) · [开放 PDF](https://www.aes.org/e-lib/download.cfm/21564.pdf?ID=21564)
+
+IE/OE 也不能混用：Harman 的研究资料分别讨论 IE 与 around/on-ear 等形态，Miller–Downey 的高频偏好实验是插入式耳机上的 Harman 基线修改，不是 Harman 官方目标的超高频版本；该实验研究了 10 kHz 以上的偏好变化，不能作为所有 IE/OE 的统一目标。[Harman/Olive/Welti/Khonsaripour 的听者分群摘要](https://secure.aes.org/forum/pubs/conventions/?elib=20289) · [Miller & Downey, AES 2023](https://doi.org/10.17743/jaes.2022.0094)
+
+可执行结论：当前不把“20 kHz 以上 Harman 曲线”作为已存在的参考输入，也不外推 Harman 数值。当前本地样例曲线 Raphael 到 20 kHz，HE1 与 Alter Ego 到约 19.897 kHz；即使未来取得一个有 20 kHz 以上目标的实验曲线，耳机侧没有对应有效实测仍然不能计算该段匹配。20 kHz 以上继续走扩展证据旁路：只有 PCM、耳机曲线和参考同时覆盖时展示实际交集，不能进入默认 D/D_high 或被文案解释为可听收益。这里的结论是“本次核验未找到可直接采用的公开 Harman 超 20 kHz 目标”，不声称其绝对不存在。
