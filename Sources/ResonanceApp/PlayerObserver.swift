@@ -187,6 +187,7 @@ public final class PlayerObserver: ObservableObject {
     private var screenCaptureTask: Task<Void, Never>?
     private var isObserving = false
     private var lastProcessIdentifier: pid_t?
+    private static let screenCaptureFallbackPreferenceKey = "resonance.screenCaptureFallbackEnabled"
 
     public init(
         bundleIdentifiers: [String] = PlayerObserver.defaultBundleIdentifiers,
@@ -203,11 +204,13 @@ public final class PlayerObserver: ObservableObject {
 
     public func start() {
         guard !isObserving else {
+            restoreScreenCaptureFallbackIfPermitted()
             refresh()
             return
         }
 
         isObserving = true
+        restoreScreenCaptureFallbackIfPermitted()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: pollingInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -339,6 +342,7 @@ public final class PlayerObserver: ObservableObject {
     /// in memory for one OCR pass, and emits candidate metadata only.
     @discardableResult
     public func enableScreenCaptureFallback() -> Bool {
+        UserDefaults.standard.set(true, forKey: Self.screenCaptureFallbackPreferenceKey)
         screenCaptureFallbackEnabled = true
 
         guard CGPreflightScreenCaptureAccess() else {
@@ -359,6 +363,7 @@ public final class PlayerObserver: ObservableObject {
     }
 
     public func disableScreenCaptureFallback() {
+        UserDefaults.standard.set(false, forKey: Self.screenCaptureFallbackPreferenceKey)
         screenCaptureFallbackEnabled = false
         screenCapturePermissionNeeded = false
         screenCaptureTask?.cancel()
@@ -776,6 +781,23 @@ public final class PlayerObserver: ObservableObject {
         let hasEvidence: Bool
     }
 
+    private struct OCRLine {
+        let text: String
+        let minX: CGFloat
+        let maxX: CGFloat
+        let y: CGFloat
+
+        var midX: CGFloat { (minX + maxX) / 2 }
+    }
+
+    private func restoreScreenCaptureFallbackIfPermitted() {
+        guard UserDefaults.standard.bool(forKey: Self.screenCaptureFallbackPreferenceKey),
+              CGPreflightScreenCaptureAccess() else { return }
+        screenCaptureFallbackEnabled = true
+        screenCapturePermissionNeeded = false
+        startScreenCaptureLoop()
+    }
+
     private func startScreenCaptureLoop() {
         guard screenCaptureTask == nil else { return }
         screenCaptureTask = Task { [weak self] in
@@ -815,44 +837,48 @@ public final class PlayerObserver: ObservableObject {
                 return
             }
 
-            let configuration = SCStreamConfiguration()
-            configuration.width = max(Int(window.frame.width), 1)
-            configuration.height = max(Int(window.frame.height), 1)
             let filter = SCContentFilter(desktopIndependentWindow: window)
+            let scale = max(CGFloat(filter.pointPixelScale), 1)
+            let configuration = SCStreamConfiguration()
+            configuration.width = max(Int(window.frame.width * scale), 1)
+            configuration.height = max(Int(window.frame.height * scale), 1)
             let image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
                 configuration: configuration
             )
-            guard let bottomBar = cropBottomBar(from: image) else {
+            guard let bottomBar = cropBottomBar(from: image, scale: scale) else {
                 updateScreenCaptureLimitation("网易云窗口没有可读取的底部播放区域")
                 return
             }
 
-            let ocr = recognizeBottomBar(bottomBar)
+            let ocr = recognizeBottomBar(bottomBar, scale: scale)
             guard ocr.hasEvidence else {
                 updateScreenCaptureLimitation("屏幕读取未识别到网易云底部播放信息")
                 return
             }
-            mergeOCR(ocr)
+            guard screenCaptureFallbackEnabled, !Task.isCancelled else { return }
+            mergeOCR(ocr, transportState: exposedMenuPlaybackState(application))
         } catch {
             updateScreenCaptureLimitation("网易云窗口屏幕读取失败：\(error.localizedDescription)")
         }
     }
 
-    private func cropBottomBar(from image: CGImage) -> CGImage? {
+    private func cropBottomBar(from image: CGImage, scale: CGFloat = 1) -> CGImage? {
         guard image.width > 0, image.height > 0 else { return nil }
-        // The screenshot is already restricted to the 网易云 window.  Keep a
-        // conservative bottom strip in memory; no full-screen image is kept or
-        // written to disk.
-        let height = min(max(image.height / 3, 120), image.height)
-        return image.cropping(to: CGRect(x: 0, y: 0, width: image.width, height: height))
+        // In the ScreenCaptureKit image used here y=0 was observed at the
+        // window top. Keep only the lower playback bar; the previous
+        // one-third crop also included song-list/search text.
+        let height = min(image.height, max(Int(80 * scale), 1))
+        let y = max(0, image.height - height)
+        return image.cropping(to: CGRect(x: 0, y: y, width: image.width, height: height))
     }
 
-    private func recognizeBottomBar(_ image: CGImage) -> OCRMetadata {
+    private func recognizeBottomBar(_ image: CGImage, scale: CGFloat = 1) -> OCRMetadata {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
-        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        request.recognitionLanguages = ["ja-JP", "zh-Hans", "en-US"]
+        request.automaticallyDetectsLanguage = true
 
         let observations: [VNRecognizedTextObservation]
         do {
@@ -864,30 +890,41 @@ public final class PlayerObserver: ObservableObject {
         }
 
         let lines = observations
-            .compactMap { observation -> (text: String, y: CGFloat)? in
+            .compactMap { observation -> OCRLine? in
                 guard let text = observation.topCandidates(1).first?.string else { return nil }
-                return (normalize(text), observation.boundingBox.midY)
+                let box = observation.boundingBox
+                return OCRLine(text: normalize(text), minX: box.minX, maxX: box.maxX, y: box.midY)
             }
             .filter { !$0.text.isEmpty }
             .sorted { $0.y > $1.y }
-            .map(\.text)
 
-        let times = lines.flatMap { clockValues(in: $0) }
+        let times = lines.flatMap { clockValues(in: $0.text) }
         let currentTime = times.count >= 2 ? times[0] : nil
         let duration = times.count >= 2 ? times[1] : nil
-        let playbackState = lines.reduce(into: PlayerPlaybackState.unknown) { state, line in
-            let lowered = line.lowercased()
-            if lowered.contains("暂停") || hasStandaloneWord("pause", in: lowered) {
+        let playbackState = lines.filter { $0.minX > 0.35 && $0.maxX < 0.7 }
+            .reduce(into: PlayerPlaybackState.unknown) { state, line in
+            let lowered = line.text.lowercased()
+            if lowered == "暂停" || lowered == "pause" {
                 state = .playing
-            } else if isPlayOCRLabel(lowered), state == .unknown {
+            } else if ["播放", "play", "resume"].contains(lowered), state == .unknown {
                 state = .paused
             }
         }
 
-        let textLines = lines.filter { !containsClock($0) && !isOCRControlLabel($0) }
-        let pair = textLines.lazy.compactMap(parseTrackPair).first
-        let title = pair?.title ?? textLines.first
-        let artist = pair?.artist ?? (textLines.count > 1 ? textLines[1] : nil)
+        let textLines = lines.filter {
+            !containsClock($0.text) && !isOCRControlLabel($0.text) &&
+                $0.minX * CGFloat(image.width) >= 80 * scale && $0.minX < 0.45
+        }
+        // Title and artist share the left metadata origin. The horizontal
+        // tolerance keeps long Japanese titles while excluding right-side
+        // like counts, quality labels, and transport controls.
+        let leftAnchor = textLines.map(\.minX).min() ?? 0
+        let leftAlignedLines = textLines.filter {
+            ($0.minX - leftAnchor) * CGFloat(image.width) <= 12 * scale
+        }
+        let pair = leftAlignedLines.lazy.compactMap { self.parseTrackPair($0.text) }.first
+        let title = pair?.title ?? leftAlignedLines.first?.text
+        let artist = pair?.artist ?? (leftAlignedLines.count > 1 ? leftAlignedLines[1].text : nil)
         let hasEvidence = title != nil || artist != nil || currentTime != nil || duration != nil || playbackState != .unknown
         return OCRMetadata(
             title: title,
@@ -899,7 +936,26 @@ public final class PlayerObserver: ObservableObject {
         )
     }
 
-    private func mergeOCR(_ ocr: OCRMetadata) {
+    private func exposedMenuPlaybackState(_ application: NSRunningApplication) -> PlayerPlaybackState {
+        guard AXIsProcessTrusted() else { return .unknown }
+        let root = AXUIElementCreateApplication(application.processIdentifier)
+        guard let rawMenuBar = copyAttribute(root, "AXMenuBar") else { return .unknown }
+        let menuBar = rawMenuBar as! AXUIElement
+        guard let controlsMenu = children(of: menuBar).first(where: {
+            ["控制", "Controls", "Control"].contains(stringValue(copyAttribute($0, "AXTitle")) ?? "")
+        }) else { return .unknown }
+        // Read the existing menu tree without opening or clicking it. The
+        // toggle action names the action available now, not the current state.
+        let labels = Set(collectNodes(from: controlsMenu).filter { $0.role == "AXMenuItem" }
+            .compactMap(\.title).map { normalize($0).lowercased() })
+        let canPause = !labels.isDisjoint(with: ["暂停", "pause"])
+        let canPlay = !labels.isDisjoint(with: ["播放", "play", "resume"])
+        if canPause && !canPlay { return .playing }
+        if canPlay && !canPause { return .paused }
+        return .unknown
+    }
+
+    private func mergeOCR(_ ocr: OCRMetadata, transportState: PlayerPlaybackState = .unknown) {
         // OCR is a candidate source only.  It cannot establish that the
         // current text belongs to the same platform track as the previous
         // snapshot, so do not carry over any identity or partially
@@ -910,7 +966,7 @@ public final class PlayerObserver: ObservableObject {
         let artist = ocr.artist
         let currentTime = ocr.currentTime
         let duration = ocr.duration
-        let playbackState = ocr.playbackState
+        let playbackState = transportState == .unknown ? ocr.playbackState : transportState
         var limitations: [String] = []
         appendUnique("屏幕 OCR 仅提供候选曲目元数据，不能证明精确歌曲 ID/链接", to: &limitations)
         appendUnique("OCR 不能证明整曲覆盖，需通过 PCM 采集状态判断", to: &limitations)
@@ -919,6 +975,7 @@ public final class PlayerObserver: ObservableObject {
         if currentTime == nil || duration == nil {
             appendUnique("OCR 未识别到完整播放进度或时长", to: &limitations)
         }
+        if playbackState == .unknown { appendUnique("尚未识别播放/暂停状态，可手动采集", to: &limitations) }
 
         let next = PlayerSnapshot(
             trackID: nil,
