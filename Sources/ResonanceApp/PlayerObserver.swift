@@ -199,6 +199,12 @@ public enum PlayerObserverEvent: Equatable {
 /// remain fallbacks when the system service has no current track.
 @MainActor
 public final class PlayerObserver: ObservableObject {
+    /// System-player reads are served by a short-lived helper whose timeout is
+    /// 2.5 seconds. Keep one verified snapshot for one additional polling
+    /// interval while the same source process is still alive. This is separate
+    /// from the three-second OCR freshness window.
+    public static let systemSnapshotFreshness: TimeInterval = 5
+
     public nonisolated static let defaultBundleIdentifiers = [
         "com.netease.163music",
         "com.netease.cloudmusic",
@@ -307,7 +313,9 @@ public final class PlayerObserver: ObservableObject {
     /// sends an action to 网易云音乐.
     @discardableResult
     public func refresh() -> PlayerSnapshot? {
-        if let systemSnapshot, Date().timeIntervalSince(systemSnapshot.observedAt) <= 3 {
+        if let systemSnapshot,
+           Date().timeIntervalSince(systemSnapshot.observedAt) <= Self.systemSnapshotFreshness,
+           canReuseSystemSnapshot(systemSnapshot) {
             permissionNeeded = false
             screenCapturePermissionNeeded = false
             screenCaptureTask?.cancel()
@@ -315,7 +323,11 @@ public final class PlayerObserver: ObservableObject {
             pendingOCRKey = nil
             pendingOCRObservedAt = nil
             publishSnapshot(systemSnapshot)
-            status = .observing
+            if let systemPlayerIssue {
+                status = .limitedMetadata(reason: "系统播放器元数据短暂不可用；沿用最近成功快照（\(systemPlayerIssue)）")
+            } else {
+                status = .observing
+            }
             return systemSnapshot
         }
         // Wait for the first system query before asking for fallback permissions.
@@ -407,6 +419,24 @@ public final class PlayerObserver: ObservableObject {
         return next
     }
 
+    /// Applies one read result from SystemPlayerReader. Keeping this small
+    /// transition separate makes the nil/error grace behavior probeable
+    /// without starting the helper or touching a real player.
+    func applySystemPlayerRead(
+        _ state: SystemPlayerState?,
+        issue: String?,
+        observedAt: Date = Date()
+    ) {
+        systemPlayerIssue = issue
+        if let state {
+            systemSnapshot = makeSystemSnapshot(state, observedAt: observedAt)
+            systemPlayerIssue = nil
+        } else if issue == nil {
+            systemPlayerIssue = "系统播放器暂时没有返回歌曲元数据"
+        }
+        _ = refresh()
+    }
+
     private func startSystemPlayerLoop() {
         let generation = observationGeneration
         systemPlayerTask = Task { [weak self] in
@@ -418,20 +448,15 @@ public final class PlayerObserver: ObservableObject {
                 catch { issue = error.localizedDescription }
                 guard !Task.isCancelled, self.isObserving,
                       self.observationGeneration == generation else { return }
-                self.systemPlayerIssue = issue
                 self.didReadSystemPlayer = true
-                // A single failed query may reuse the last successful sample
-                // only within the same three-second freshness window.
-                if let state { self.systemSnapshot = self.makeSystemSnapshot(state) }
-                else if issue == nil { self.systemSnapshot = nil }
-                self.refresh()
+                self.applySystemPlayerRead(state, issue: issue)
                 do { try await Task.sleep(nanoseconds: 800_000_000) }
                 catch { return }
             }
         }
     }
 
-    private func makeSystemSnapshot(_ state: SystemPlayerState) -> PlayerSnapshot {
+    private func makeSystemSnapshot(_ state: SystemPlayerState, observedAt: Date = Date()) -> PlayerSnapshot {
         let application = state.processIdentifier.flatMap { NSRunningApplication(processIdentifier: $0) }
             ?? state.bundleIdentifier.flatMap {
                 NSRunningApplication.runningApplications(withBundleIdentifier: $0).first
@@ -440,6 +465,7 @@ public final class PlayerObserver: ObservableObject {
             trackID: nil, trackURL: nil, title: state.title, artist: state.artist, album: state.album,
             currentTime: state.currentTime, duration: state.duration,
             playbackState: state.playing.map { $0 ? .playing : .paused } ?? .unknown,
+            observedAt: observedAt,
             metadataSource: .systemPlayer,
             sourceBundleIdentifier: state.bundleIdentifier ?? application?.bundleIdentifier,
             sourceApplicationName: application?.localizedName ?? state.bundleIdentifier,
@@ -620,6 +646,20 @@ public final class PlayerObserver: ObservableObject {
             guard !$0.isTerminated, let name = $0.localizedName else { return false }
             return names.contains(name)
         }
+    }
+
+    private func canReuseSystemSnapshot(_ snapshot: PlayerSnapshot) -> Bool {
+        guard snapshot.metadataSource == .systemPlayer,
+              let sourceProcessIdentifier = snapshot.sourceProcessIdentifier,
+              let sourceApplication = NSRunningApplication(processIdentifier: sourceProcessIdentifier),
+              !sourceApplication.isTerminated else {
+            return false
+        }
+        if let sourceBundleIdentifier = snapshot.sourceBundleIdentifier,
+           sourceApplication.bundleIdentifier != sourceBundleIdentifier {
+            return false
+        }
+        return true
     }
 
     private func collectNodes(from application: AXUIElement) -> [AXNode] {

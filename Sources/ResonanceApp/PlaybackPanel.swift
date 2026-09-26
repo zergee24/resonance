@@ -161,6 +161,7 @@ extension AppModel {
         captureRequestID = requestID
         captureIsAutomatic = automatically
         captureTrackID = trackID
+        captureHadMetadataGap = false
         captureIdentity = player.snapshot
         status = "正在连接网易云进程音频…"
         if automatically { automaticListeningStatus = "正在启动连续采集" }
@@ -222,12 +223,15 @@ extension AppModel {
         let automatic = captureIsAutomatic
         let storedID = captureTrackID
         let processID = capturedProcessID
+        let hadMetadataGap = captureHadMetadataGap
         captureIdentity = nil
         captureTrackID = nil
         captureIsAutomatic = false
+        captureHadMetadataGap = false
         let stoppedAt = Date()
         var notes = ["已录 \(String(format: "%.1f", summary.duration)) 秒；完整度未知，按片段估计。"]
         if let boundaryNote { notes.append(boundaryNote) }
+        if hadMetadataGap { notes.append("录音期间系统播放信息曾短暂中断，期间未确认精确曲目边界。") }
         if identity?.trackID == nil {
             notes.append(identity?.metadataSource == .systemPlayer ? "歌曲信息来自系统播放器，尚未关联网易云 ID。" : "歌曲身份仅为候选，按已录内容估计。")
         }
@@ -264,6 +268,11 @@ extension AppModel {
         busy = true
         analysisTask = Task {
             await previousAnalysis?.value
+            let analysisActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.background, .idleSystemSleepDisabled],
+                reason: "Resonance audio analysis"
+            )
+            defer { ProcessInfo.processInfo.endActivity(analysisActivity) }
             busy = true
             defer { if analysisRevision == revision { busy = false } }
             do {

@@ -64,7 +64,7 @@ extension AppModel {
     func syncFollowedPlayback() {
         guard isFollowPlaying,
               let snapshot = player.snapshot,
-              Date().timeIntervalSince(snapshot.observedAt) <= 3,
+              Date().timeIntervalSince(snapshot.observedAt) <= (snapshot.metadataSource == .systemPlayer ? PlayerObserver.systemSnapshotFreshness : 3),
               player.canCaptureCurrentSource else {
             if isFollowPlaying, !player.canCaptureCurrentSource {
                 selectedTrackID = nil
@@ -78,7 +78,12 @@ extension AppModel {
         guard !isShuttingDown else { return }
         // OCR may fail without immediately clearing the previous UI snapshot.
         // An old title is never evidence that the same audio is still playing.
-        let snapshot = player.snapshot.flatMap { Date().timeIntervalSince($0.observedAt) <= 3 ? $0 : nil }
+        let snapshot = player.snapshot.flatMap {
+            Date().timeIntervalSince($0.observedAt) <= ($0.metadataSource == .systemPlayer ? PlayerObserver.systemSnapshotFreshness : 3) ? $0 : nil
+        }
+        if capture.isRecording, snapshot?.metadataSource == .systemPlayer, player.systemPlayerIssue != nil {
+            captureHadMetadataGap = true
+        }
         // Keep the observer independent of the currently visible page. Losing
         // identity is a recording boundary even when no player event arrives.
         if snapshot != nil, captureIdentity != nil, !player.canCaptureCurrentSource {

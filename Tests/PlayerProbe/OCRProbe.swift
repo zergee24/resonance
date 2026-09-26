@@ -34,11 +34,13 @@ struct OCRProbe {
         try verifyRedBadgeMask(observer)
         try verifyOCRStability()
         try verifySystemMetadata()
+        try verifySystemReadGrace()
         try verifyLegacyTrackDecode()
         print("PASS production OCR crop probe: normal=\(cropped.width)x\(cropped.height), small=\(smallCrop.width)x\(smallCrop.height), bottom pixels only")
         print("PASS red VIP badge probe: compact red badge masked, white VIP title pixels retained")
         print("PASS OCR boundaries: single-frame noise ignored, repeated change accepted, pause immediate, stale identity expires")
         print("PASS system metadata: source-aware keys, opaque IDs, source matching, and system-player priority")
+        print("PASS system snapshot freshness: five-second helper grace, pause and next-track events remain explicit")
         print("PASS legacy TrackEntry JSON: optional source metadata decodes as nil")
     }
 
@@ -199,6 +201,118 @@ struct OCRProbe {
             sourceProcessIdentifier: 401
         ))
         try require(observer.snapshot == base, "OCR candidate replaced a fresher system-player snapshot")
+
+        try require(PlayerObserver.systemSnapshotFreshness == 5, "system-player freshness window must be five seconds")
+
+        let eventObserver = PlayerObserver(bundleIdentifiers: [])
+        var events: [PlayerObserverEvent] = []
+        eventObserver.eventHandler = { events.append($0) }
+        eventObserver.publishSnapshot(base)
+        eventObserver.publishSnapshot(PlayerSnapshot(
+            trackID: nil, trackURL: nil, title: "同名歌曲", artist: "同名艺人", album: nil,
+            currentTime: 13, duration: 180, playbackState: .paused,
+            observedAt: Date(timeIntervalSince1970: 201),
+            metadataSource: .systemPlayer,
+            sourceBundleIdentifier: "com.example.player-a",
+            sourceProcessIdentifier: 401,
+            systemItemIdentifier: opaqueID
+        ))
+        eventObserver.publishSnapshot(otherItem)
+        try require(events.contains { if case .playbackStateChanged(.paused) = $0 { return true }; return false },
+                    "explicit system-player pause did not emit a pause event")
+        try require(events.contains { if case .trackChanged = $0 { return true }; return false },
+                    "a different system-player item did not emit a track boundary")
+    }
+
+    @MainActor
+    private static func verifySystemReadGrace() throws {
+        guard let liveApplication = NSWorkspace.shared.runningApplications.first(where: {
+            !$0.isTerminated && $0.processIdentifier > 0 && $0.bundleIdentifier != nil
+        }) else {
+            throw ProbeFailure("no live application was available for system snapshot freshness probe")
+        }
+        let processID = liveApplication.processIdentifier
+        let processBundle = liveApplication.bundleIdentifier
+        let baseState = SystemPlayerState(
+            title: "稳定歌曲",
+            artist: "稳定艺人",
+            duration: 180,
+            currentTime: 12,
+            playing: true,
+            bundleIdentifier: processBundle,
+            processIdentifier: processID,
+            contentItemIdentifier: "stable-item"
+        )
+        let observer = PlayerObserver(bundleIdentifiers: [])
+        let observedAt = Date(timeIntervalSinceNow: -1)
+        let base = observer.makeSystemSnapshot(baseState, observedAt: observedAt)
+        observer.systemSnapshot = base
+        observer.publishSnapshot(base)
+
+        // A null reader result and a helper error retain the same verified
+        // identity and its original observation time during the grace window.
+        observer.applySystemPlayerRead(nil, issue: nil)
+        try require(observer.snapshot?.candidateKey == base.candidateKey, "nil system read changed the active identity")
+        try require(observer.snapshot?.observedAt == observedAt, "nil system read fabricated freshness")
+        try require(observer.systemPlayerIssue != nil, "nil system read did not expose a short interruption")
+        observer.applySystemPlayerRead(nil, issue: "系统播放器读取超时")
+        try require(observer.snapshot?.candidateKey == base.candidateKey, "helper error changed the active identity")
+        try require(observer.snapshot?.observedAt == observedAt, "helper error fabricated freshness")
+
+        // Once the last verified sample is outside the five-second window,
+        // the observer must let it expire instead of freezing it indefinitely.
+        let expiredObserver = PlayerObserver(bundleIdentifiers: [])
+        let expiredAt = Date(timeIntervalSinceNow: -6)
+        let expired = expiredObserver.makeSystemSnapshot(baseState, observedAt: expiredAt)
+        expiredObserver.systemSnapshot = expired
+        expiredObserver.publishSnapshot(expired)
+        expiredObserver.applySystemPlayerRead(nil, issue: "系统播放器读取超时")
+        try require(expiredObserver.snapshot == nil && expiredObserver.systemSnapshot == nil,
+                    "expired system snapshot was reused")
+
+        // A dead source PID invalidates the grace path immediately.
+        let deadObserver = PlayerObserver(bundleIdentifiers: [])
+        let deadState = SystemPlayerState(
+            title: "已退出来源",
+            artist: "来源",
+            duration: 180,
+            currentTime: 12,
+            playing: true,
+            bundleIdentifier: "com.example.exited",
+            processIdentifier: Int32.max,
+            contentItemIdentifier: "dead-item"
+        )
+        let dead = deadObserver.makeSystemSnapshot(deadState, observedAt: Date())
+        deadObserver.systemSnapshot = dead
+        deadObserver.publishSnapshot(dead)
+        deadObserver.applySystemPlayerRead(nil, issue: "系统播放器读取超时")
+        try require(deadObserver.snapshot == nil && deadObserver.systemSnapshot == nil,
+                    "dead source PID was reused")
+
+        // A successful state from another live source replaces the old state;
+        // it must not fall back to the NetEase AX snapshot.
+        let otherObserver = PlayerObserver(bundleIdentifiers: [])
+        var trackChanges = 0
+        otherObserver.eventHandler = { event in
+            if case .trackChanged = event { trackChanges += 1 }
+        }
+        otherObserver.systemSnapshot = base
+        otherObserver.publishSnapshot(base)
+        trackChanges = 0
+        let otherState = SystemPlayerState(
+            title: "其他播放器歌曲",
+            artist: "其他来源",
+            duration: 200,
+            currentTime: 4,
+            playing: true,
+            bundleIdentifier: processBundle,
+            processIdentifier: processID,
+            contentItemIdentifier: "other-source-item"
+        )
+        otherObserver.applySystemPlayerRead(otherState, issue: nil)
+        try require(otherObserver.snapshot?.title == "其他播放器歌曲",
+                    "successful other-source state was replaced by a fallback snapshot")
+        try require(trackChanges == 1, "successful other-source state did not create one boundary")
     }
 
     private static func verifyLegacyTrackDecode() throws {

@@ -149,6 +149,7 @@ public final class AudioCapture: ObservableObject {
     )
     private var activeStartID: UUID?
     private var pendingStartOperation: CaptureStartOperation?
+    private var captureActivity: NSObjectProtocol?
 
     public init() {}
 
@@ -197,10 +198,15 @@ public final class AudioCapture: ObservableObject {
             }
             activeStartID = nil
             session = newSession
+            captureActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.background, .latencyCritical, .idleSystemSleepDisabled],
+                reason: "Resonance audio capture"
+            )
             isRecording = true
             status = .recording
             startMeterTimer()
         } catch {
+            endCaptureActivity()
             isRecording = false
             if case AudioCaptureError.startCancelled = error {
                 status = .idle
@@ -232,6 +238,7 @@ public final class AudioCapture: ObservableObject {
     @discardableResult
     public func stop() -> CaptureSummary? {
         guard let session else {
+            endCaptureActivity()
             return nil
         }
 
@@ -243,6 +250,7 @@ public final class AudioCapture: ObservableObject {
         meter = 0
 
         let summary = session.stop()
+        endCaptureActivity()
         if let writerError = summary.writerError {
             status = .failed(writerError)
         } else {
@@ -275,6 +283,15 @@ public final class AudioCapture: ObservableObject {
     deinit {
         meterTimer?.invalidate()
         _ = session?.stop()
+        if let captureActivity {
+            ProcessInfo.processInfo.endActivity(captureActivity)
+        }
+    }
+
+    private func endCaptureActivity() {
+        guard let captureActivity else { return }
+        ProcessInfo.processInfo.endActivity(captureActivity)
+        self.captureActivity = nil
     }
 }
 

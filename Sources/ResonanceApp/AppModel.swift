@@ -51,6 +51,7 @@ final class AppModel: ObservableObject {
     let player = PlayerObserver()
     @Published var captureStartedAt: Date?
     var captureIdentity: PlayerSnapshot?
+    var captureHadMetadataGap = false
     var lastPlayerPosition: (TimeInterval, Date)?
     var database: LocalStore?
     var matchTask: Task<Void, Never>?
