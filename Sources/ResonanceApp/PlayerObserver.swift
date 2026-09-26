@@ -187,6 +187,8 @@ public final class PlayerObserver: ObservableObject {
     private var screenCaptureTask: Task<Void, Never>?
     private var isObserving = false
     private var lastProcessIdentifier: pid_t?
+    private var pendingOCRKey: String?
+    private var pendingOCRObservedAt: Date?
     private static let screenCaptureFallbackPreferenceKey = "resonance.screenCaptureFallbackEnabled"
 
     public init(
@@ -221,6 +223,8 @@ public final class PlayerObserver: ObservableObject {
     }
 
     public func stop() {
+        pendingOCRKey = nil
+        pendingOCRObservedAt = nil
         isObserving = false
         timer?.invalidate()
         timer = nil
@@ -239,6 +243,8 @@ public final class PlayerObserver: ObservableObject {
     @discardableResult
     public func refresh() -> PlayerSnapshot? {
         guard let application = locatePlayer() else {
+            pendingOCRKey = nil
+            pendingOCRObservedAt = nil
             lastProcessIdentifier = nil
             publishSnapshot(nil)
             permissionNeeded = false
@@ -248,6 +254,8 @@ public final class PlayerObserver: ObservableObject {
 
         if let previousProcessIdentifier = lastProcessIdentifier,
            previousProcessIdentifier != application.processIdentifier {
+            pendingOCRKey = nil
+            pendingOCRObservedAt = nil
             publishSnapshot(nil)
         }
         lastProcessIdentifier = application.processIdentifier
@@ -363,6 +371,8 @@ public final class PlayerObserver: ObservableObject {
     }
 
     public func disableScreenCaptureFallback() {
+        pendingOCRKey = nil
+        pendingOCRObservedAt = nil
         UserDefaults.standard.set(false, forKey: Self.screenCaptureFallbackPreferenceKey)
         screenCaptureFallbackEnabled = false
         screenCapturePermissionNeeded = false
@@ -853,6 +863,8 @@ public final class PlayerObserver: ObservableObject {
 
             let ocr = recognizeBottomBar(bottomBar, scale: scale)
             guard ocr.hasEvidence else {
+                pendingOCRKey = nil
+                pendingOCRObservedAt = nil
                 updateScreenCaptureLimitation("屏幕读取未识别到网易云底部播放信息")
                 return
             }
@@ -989,8 +1001,37 @@ public final class PlayerObserver: ObservableObject {
             identityEvidence: .candidate,
             limitations: limitations
         )
-        publishSnapshot(next)
+        publishStableOCR(next)
         status = .limitedMetadata(reason: limitations.joined(separator: "；"))
+    }
+
+    private func publishStableOCR(_ next: PlayerSnapshot) {
+        let previous = snapshot.flatMap { $0.identityEvidence == .candidate ? $0 : nil }
+        let hasTitle = !(next.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let repeatsPending = hasTitle && pendingOCRKey == next.candidateKey &&
+            pendingOCRObservedAt.map { next.observedAt.timeIntervalSince($0) <= 3 } == true
+        if hasTitle && (previous?.candidateKey == next.candidateKey || repeatsPending) {
+            pendingOCRKey = nil
+            pendingOCRObservedAt = nil
+            publishSnapshot(next)
+            return
+        }
+
+        // A single OCR change can be a badge, animation, or recognition error.
+        // Confirm it on the next read before creating a new recording segment.
+        pendingOCRKey = hasTitle ? next.candidateKey : nil
+        pendingOCRObservedAt = hasTitle ? next.observedAt : nil
+        guard let previous else { return }
+        // Transport state is independent of identity. Pause immediately while
+        // preserving the old identity's timestamp so unstable text can expire.
+        publishSnapshot(PlayerSnapshot(
+            trackID: nil, trackURL: nil, title: previous.title,
+            artist: previous.artist, album: previous.album,
+            currentTime: nil, duration: previous.duration,
+            playbackState: next.playbackState == .playing ? previous.playbackState : next.playbackState,
+            identityEvidence: .candidate,
+            limitations: previous.limitations, observedAt: previous.observedAt
+        ))
     }
 
     private func updateScreenCaptureLimitation(_ reason: String) {
@@ -1032,6 +1073,10 @@ public final class PlayerObserver: ObservableObject {
     }
 
     private func publishSnapshot(_ next: PlayerSnapshot?) {
+        if next?.identityEvidence != .candidate && (snapshot != nil || next != nil) {
+            pendingOCRKey = nil
+            pendingOCRObservedAt = nil
+        }
         let previous = snapshot
 
         // PlayerSnapshot equality intentionally ignores observedAt so a

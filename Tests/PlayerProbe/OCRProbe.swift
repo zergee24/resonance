@@ -31,7 +31,50 @@ struct OCRProbe {
         }
         try require(smallCrop.width == small.width && smallCrop.height == small.height, "small image crop exceeded image bounds")
 
+        try verifyOCRStability()
         print("PASS production OCR crop probe: normal=\(cropped.width)x\(cropped.height), small=\(smallCrop.width)x\(smallCrop.height), bottom pixels only")
+        print("PASS OCR boundaries: single-frame noise ignored, repeated change accepted, pause immediate, stale identity expires")
+    }
+
+    @MainActor
+    private static func verifyOCRStability() throws {
+        let observer = PlayerObserver(bundleIdentifiers: [])
+        var changedTitles: [String] = []
+        var paused = false
+        observer.eventHandler = { event in
+            if case .trackChanged(let value) = event { changedTitles.append(value.title ?? "") }
+            if case .playbackStateChanged(.paused) = event { paused = true }
+        }
+        func read(_ title: String?, _ time: Double, _ state: PlayerPlaybackState = .playing) {
+            observer.publishStableOCR(PlayerSnapshot(
+                trackID: nil, trackURL: nil, title: title, artist: "Artist", album: nil,
+                currentTime: nil, duration: nil, playbackState: state,
+                observedAt: Date(timeIntervalSince1970: time)
+            ))
+        }
+        read("A", 0)
+        try require(observer.snapshot == nil, "first OCR frame must await confirmation")
+        observer.publishSnapshot(nil) // Empty AX polling between the two OCR reads.
+        read("A", 1)
+        try require(observer.snapshot?.title == "A", "empty AX polling erased the initial OCR candidate")
+        read("B", 2)
+        read("A", 3)
+        try require(changedTitles == ["A"], "one noisy OCR frame split the recording")
+        read("B", 4)
+        read("B", 5)
+        try require(changedTitles == ["A", "B"], "a repeated new title did not create exactly one boundary")
+        read("C", 6, .paused)
+        try require(paused && observer.snapshot?.title == "B", "pending identity delayed pause or replaced accepted identity")
+        try require(observer.snapshot?.observedAt == Date(timeIntervalSince1970: 5), "pending OCR refreshed old identity")
+        read("D", 7)
+        try require(observer.snapshot?.playbackState == .paused, "unconfirmed new title resumed recording under the old identity")
+        read("E", 9)
+        try require(observer.snapshot?.observedAt == Date(timeIntervalSince1970: 5), "persistent OCR noise prevented identity expiration")
+        read("E", 10)
+        try require(changedTitles == ["A", "B", "E"], "stable identity did not recover after noise")
+        read(nil, 11)
+        read(nil, 12)
+        try require(observer.snapshot?.title == "E" && observer.snapshot?.observedAt == Date(timeIntervalSince1970: 10), "missing title replaced or refreshed accepted identity")
     }
 
     private enum PixelColor: Equatable {
