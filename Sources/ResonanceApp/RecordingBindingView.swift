@@ -44,14 +44,16 @@ struct RecordingBindingView: View {
             footer
         }
         .padding(22)
-        .frame(minWidth: 560, minHeight: 520)
+        .frame(minWidth: 700, minHeight: 680)
+        .font(Typography.body)
+        .controlSize(.large)
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("确认录音归属").font(.title2.weight(.semibold))
+            Text("确认录音归属").font(Typography.title.weight(.semibold))
             Text("选择这段录音对应的歌曲，将分析结果加入歌单。")
-                .font(.callout)
+                .font(Typography.secondary)
                 .foregroundStyle(Palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -62,28 +64,30 @@ struct RecordingBindingView: View {
             SectionCaption(title: "待绑定录音", trailing: recording.coverageLabel)
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "waveform.and.mic")
-                    .font(.title3)
+                    .font(Typography.heading)
                     .foregroundStyle(Palette.accent)
                     .frame(width: 30)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(recording.title.isEmpty ? "未命名录音" : recording.title)
-                        .font(.system(size: 14, weight: .medium))
+                        .font(Typography.body.weight(.medium))
                     Text(recording.artist.isEmpty ? "艺人未知" : recording.artist)
-                        .font(.system(size: 12))
+                        .font(Typography.secondary)
                         .foregroundStyle(Palette.muted)
                     if let application = recording.sourceApplicationName?.trimmingCharacters(in: .whitespacesAndNewlines), !application.isEmpty {
-                        HStack(spacing: 5) {
-                            Image(systemName: "app.badge").font(.caption2)
-                            Text("来源：\(application)")
-                            if let bundleID = recording.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleID.isEmpty {
-                                Text(bundleID).font(.caption2).lineLimit(1).truncationMode(.middle).help("来源 Bundle ID")
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "app.badge")
+                                Text("来源：\(application)")
                             }
-                        }.font(.caption2).foregroundStyle(Palette.muted)
+                            if let bundleID = recording.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleID.isEmpty {
+                                Text(bundleID).font(Typography.mono).lineLimit(1).truncationMode(.middle).help("来源 Bundle ID")
+                            }
+                        }.font(Typography.secondary).foregroundStyle(Palette.muted)
                     } else if let bundleID = recording.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleID.isEmpty {
                         HStack(spacing: 5) {
-                            Image(systemName: "app.badge").font(.caption2)
-                            Text("来源 Bundle：\(bundleID)").lineLimit(1).truncationMode(.middle)
-                        }.font(.caption2).foregroundStyle(Palette.muted)
+                            Image(systemName: "app.badge")
+                            Text("来源 Bundle：\(bundleID)").font(Typography.mono).lineLimit(2).truncationMode(.middle)
+                        }.font(Typography.secondary).foregroundStyle(Palette.muted)
                     }
                     HStack(spacing: 8) {
                         TinyBadge(text: recording.analyzed ? "已有频谱分析" : "尚未完成分析", color: recording.analyzed ? Palette.accent : .orange)
@@ -111,7 +115,7 @@ struct RecordingBindingView: View {
                     title: "没有待绑定的歌单原始行",
                     detail: "请先导入歌单，并确认其中的曲目还没有真实音频分析结果。"
                 )
-                .frame(minHeight: 150)
+                .frame(minHeight: 200)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 6) {
@@ -120,7 +124,7 @@ struct RecordingBindingView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 235)
+                .frame(maxHeight: 320)
             }
         }
     }
@@ -138,7 +142,7 @@ struct RecordingBindingView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 7) {
                         Text(candidate.title.isEmpty ? "未命名曲目" : candidate.title)
-                            .font(.system(size: 12, weight: .medium))
+                            .font(Typography.body.weight(.medium))
                             .foregroundStyle(.primary)
                         if let id = candidate.neteaseID, !id.isEmpty {
                             TinyBadge(text: "ID \(id)", color: Palette.muted)
@@ -147,10 +151,10 @@ struct RecordingBindingView: View {
                         }
                     }
                     Text(candidate.artist.isEmpty ? "艺人未知" : candidate.artist)
-                        .font(.system(size: 11))
+                        .font(Typography.secondary)
                         .foregroundStyle(Palette.muted)
                     Text("来源歌单：\(model.playlistName(for: candidate.sourcePlaylistID)) · 原始顺序 \(candidate.sourceOrder + 1)")
-                        .font(.system(size: 10))
+                        .font(Typography.secondary)
                         .foregroundStyle(Palette.muted)
                 }
                 Spacer(minLength: 0)
@@ -169,7 +173,7 @@ struct RecordingBindingView: View {
     private var confirmation: some View {
         Toggle("我确认这段录音确实来自此曲目/版本", isOn: $confirmed)
             .toggleStyle(.checkbox)
-            .font(.callout.weight(.medium))
+            .font(Typography.body.weight(.medium))
             .disabled(selectedCandidate == nil)
     }
 
@@ -177,7 +181,7 @@ struct RecordingBindingView: View {
         HStack {
             if recording.featurePath == nil {
                 Label("录音尚未完成频谱分析，不能绑定到可排序曲目。", systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 11))
+                    .font(Typography.secondary)
                     .foregroundStyle(.orange)
             }
             Spacer()

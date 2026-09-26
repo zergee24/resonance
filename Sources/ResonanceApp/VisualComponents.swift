@@ -1,5 +1,13 @@
 import SwiftUI
 
+enum Typography {
+    static let body = Font.system(size: 20)
+    static let secondary = Font.system(size: 18)
+    static let heading = Font.system(size: 22, weight: .semibold)
+    static let title = Font.system(size: 32, weight: .medium)
+    static let mono = Font.system(size: 18, design: .monospaced)
+}
+
 enum Palette {
     static let accent = Color(red: 0.42, green: 0.88, blue: 0.75)
     static let base = Color(red: 0.064, green: 0.075, blue: 0.085)
@@ -21,19 +29,23 @@ struct FrequencyPlot: View {
 
     var body: some View {
         Canvas { context, size in
-            let left: CGFloat = 38, right: CGFloat = 12, top: CGFloat = 12, bottom: CGFloat = 25
+            let left: CGFloat = 62, right: CGFloat = 30, top: CGFloat = 16, bottom: CGFloat = 40
             let width = size.width - left - right, height = size.height - top - bottom
             func x(_ hz: Double) -> CGFloat { left + CGFloat((log10(max(20, hz)) - log10(20)) / (log10(maxFrequency) - log10(20))) * width }
             func y(_ db: Double) -> CGFloat { top + CGFloat((maxDB - db) / (maxDB - minDB)) * height }
+            var previousLabelX = -CGFloat.infinity
             for hz in [20.0, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 40_000] where hz <= maxFrequency {
                 var p = Path(); p.move(to: CGPoint(x: x(hz), y: top)); p.addLine(to: CGPoint(x: x(hz), y: top + height))
                 context.stroke(p, with: .color(.white.opacity(hz == 20_000 ? 0.2 : 0.06)), style: StrokeStyle(lineWidth: 1, dash: hz == 20_000 ? [3, 3] : []))
-                context.draw(Text(frequencyLabel(hz)).font(.system(size: 9, design: .monospaced)).foregroundColor(Palette.muted), at: CGPoint(x: x(hz), y: top + height + 13))
+                if x(hz) - previousLabelX >= 58 {
+                    context.draw(Text(frequencyLabel(hz)).font(Typography.mono).foregroundColor(Palette.muted), at: CGPoint(x: x(hz), y: top + height + 23))
+                    previousLabelX = x(hz)
+                }
             }
             for db in stride(from: minDB, through: maxDB, by: (maxDB - minDB) / 4) {
                 var p = Path(); p.move(to: CGPoint(x: left, y: y(db))); p.addLine(to: CGPoint(x: left + width, y: y(db)))
                 context.stroke(p, with: .color(.white.opacity(db == 0 ? 0.16 : 0.06)), lineWidth: 1)
-                context.draw(Text(String(format: "%g", db)).font(.system(size: 9, design: .monospaced)).foregroundColor(Palette.muted), at: CGPoint(x: 15, y: y(db)))
+                context.draw(Text(String(format: "%g", db)).font(Typography.mono).foregroundColor(Palette.muted), at: CGPoint(x: left - 10, y: y(db)), anchor: .trailing)
             }
             context.clip(to: Path(CGRect(x: left, y: top, width: width, height: height)))
             for line in lines {
@@ -56,8 +68,8 @@ struct EmptyPanel: View {
     var body: some View {
         VStack(spacing: 14) {
             Image(systemName: icon).font(.system(size: 35, weight: .ultraLight)).foregroundStyle(Palette.accent)
-            Text(title).font(.title3.weight(.medium))
-            Text(detail).font(.callout).foregroundStyle(Palette.muted).multilineTextAlignment(.center).frame(maxWidth: 430)
+            Text(title).font(Typography.heading.weight(.medium))
+            Text(detail).font(Typography.body).foregroundStyle(Palette.muted).multilineTextAlignment(.center).frame(maxWidth: 430)
         }.frame(maxWidth: .infinity, minHeight: 240).padding(24)
     }
 }
@@ -65,11 +77,11 @@ struct EmptyPanel: View {
 struct TinyBadge: View {
     var text: String
     var color: Color = Palette.muted
-    var body: some View { Text(text).font(.system(size: 10, weight: .medium)).foregroundStyle(color).padding(.horizontal, 7).padding(.vertical, 4).background(color.opacity(0.09), in: Capsule()) }
+    var body: some View { Text(text).font(.system(size: 18, weight: .medium)).foregroundStyle(color).padding(.horizontal, 7).padding(.vertical, 4).background(color.opacity(0.09), in: Capsule()) }
 }
 
 struct SectionCaption: View {
     var title: String
     var trailing: String = ""
-    var body: some View { HStack { Text(title).font(.system(size: 12, weight: .semibold)); Spacer(); Text(trailing).font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.muted) }.padding(.bottom, 8) }
+    var body: some View { HStack { Text(title).font(.system(size: 18, weight: .semibold)); Spacer(); Text(trailing).font(.system(size: 18, design: .monospaced)).foregroundStyle(Palette.muted) }.padding(.bottom, 8) }
 }

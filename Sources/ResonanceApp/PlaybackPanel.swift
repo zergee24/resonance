@@ -13,84 +13,113 @@ struct PlaybackContents: View {
     @ObservedObject var capture: AudioCapture
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            HStack(spacing: 13) {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 9).fill(Palette.accent.opacity(0.10)).frame(width: 44, height: 44)
                     Image(systemName: capture.isRecording ? "waveform" : "play.rectangle").foregroundStyle(Palette.accent)
                 }
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(player.snapshot?.title ?? "当前系统播放").font(.system(size: 13, weight: .medium))
-                    Text(player.snapshot?.artist ?? player.status.message).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(2)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(player.snapshot?.title ?? "当前系统播放")
+                        .font(Typography.body.weight(.medium))
+                        .lineLimit(2)
+                    Text(player.snapshot?.artist ?? player.status.message)
+                        .font(Typography.secondary)
+                        .foregroundStyle(Palette.muted)
+                        .lineLimit(2)
                     if let snapshot = player.snapshot {
-                        HStack(spacing: 5) {
-                            Text("来源：\(sourceLabel(for: snapshot)) · \(snapshot.metadataSource.label)")
+                        Text("来源：\(sourceLabel(for: snapshot)) · \(snapshot.metadataSource.label)")
+                            .font(Typography.secondary)
+                            .foregroundStyle(Palette.muted)
+                            .lineLimit(2)
+                        HStack(spacing: 10) {
                             if let bundleID = snapshot.sourceBundleIdentifier, !bundleID.isEmpty {
-                                Text(bundleID).lineLimit(1).truncationMode(.middle)
+                                Text("Bundle ID：\(bundleID)").lineLimit(1).truncationMode(.middle)
                             }
                             if let processID = snapshot.sourceProcessIdentifier {
                                 Text("PID \(processID)")
                             }
                         }
-                        .font(.system(size: 10))
+                        .font(Typography.secondary)
                         .foregroundStyle(Palette.muted)
                         if let currentTime = snapshot.currentTime, let duration = snapshot.duration, duration > 0 {
-                            HStack(spacing: 7) {
+                            HStack(spacing: 9) {
                                 ProgressView(value: min(max(currentTime / duration, 0), 1))
                                 Text("\(durationLabel(currentTime)) / \(durationLabel(duration))")
-                                    .font(.system(size: 10, design: .monospaced))
+                                    .font(Typography.mono)
                             }
                             .foregroundStyle(Palette.muted)
                         }
                     }
                 }
-                Spacer()
-                if capture.isRecording {
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if capture.isRecording {
+                HStack(spacing: 12) {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
-                        Text(durationLabel(context.date.timeIntervalSince(model.captureStartedAt ?? context.date))).font(.system(size: 12, design: .monospaced)).foregroundStyle(Palette.accent)
+                        Text(durationLabel(context.date.timeIntervalSince(model.captureStartedAt ?? context.date)))
+                            .font(Typography.mono)
+                            .foregroundStyle(Palette.accent)
                     }
-                    ProgressView(value: Double(min(1, capture.meter))).frame(width: 70)
+                    ProgressView(value: Double(min(1, capture.meter))).frame(width: 110)
+                    Spacer()
                     Button("停止并分析", systemImage: "stop.fill") {
                         model.automaticListeningPolicy.markCaptureAttempted()
                         model.finishCapture()
                     }.buttonStyle(.borderedProminent)
+                        .font(Typography.secondary)
                         .help("停止当前连续段；自动积累保持开启，下一次切歌或暂停后恢复播放时继续。")
-                } else {
+                }
+            } else {
+                HStack(spacing: 12) {
                     Button("读取当前歌曲") { player.start(); player.refresh() }
                     Button("采集网易云音频", systemImage: "record.circle") { model.beginCapture() }
                         .disabled(model.busy || capture.status == .starting || hasExplicitOtherSource)
                         .help(hasExplicitOtherSource ? "当前系统播放来源不是网易云" : "采集网易云当前播放音频")
                 }
+                .font(Typography.secondary)
             }
-            HStack(spacing: 12) {
-                if player.permissionNeeded { Button("允许辅助功能") { _ = player.requestAccessibilityPermission() } }
-                if !player.screenCaptureFallbackEnabled { Button("启用窗口识别备选") { _ = player.enableScreenCaptureFallback() } }
-                else { Button("关闭窗口识别") { player.disableScreenCaptureFallback() } }
-                if player.snapshot?.isCandidate == true { TinyBadge(text: "未关联网易云 ID", color: .orange) }
-                if hasExplicitOtherSource { TinyBadge(text: "当前来源不采集", color: .orange) }
-                Spacer()
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    if player.permissionNeeded { Button("允许辅助功能") { _ = player.requestAccessibilityPermission() } }
+                    if !player.screenCaptureFallbackEnabled { Button("启用窗口识别备选") { _ = player.enableScreenCaptureFallback() } }
+                    else { Button("关闭窗口识别") { player.disableScreenCaptureFallback() } }
+                }
+                .font(Typography.secondary)
+                .buttonStyle(.link)
+                HStack(spacing: 10) {
+                    if player.snapshot?.isCandidate == true { TinyBadge(text: "未关联网易云 ID", color: .orange) }
+                    if hasExplicitOtherSource { TinyBadge(text: "当前来源不采集", color: .orange) }
+                }
                 Text(capture.isRecording ? "只采集网易云进程 · 本地保存" : (hasExplicitOtherSource ? "仅显示系统播放信息" : "音频采集与歌曲识别可分别使用"))
-                    .font(.system(size: 10)).foregroundStyle(Palette.muted)
-            }.font(.system(size: 10)).buttonStyle(.link)
+                    .font(Typography.secondary)
+                    .foregroundStyle(Palette.muted)
+            }
             if let issue = player.systemPlayerIssue,
                player.snapshot?.metadataSource != .systemPlayer {
                 Text("系统播放器读取失败：\(issue)；可使用辅助功能或窗口识别")
-                    .font(.system(size: 10)).foregroundStyle(.orange)
+                    .font(Typography.secondary)
+                    .foregroundStyle(.orange)
             }
             if case .failed(let message) = capture.status {
                 HStack {
-                    Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    Text(message).font(Typography.secondary).foregroundStyle(.orange).textSelection(.enabled)
                     if model.automaticListeningEnabled {
                         Button("重试当前歌曲采集") { model.retryAutomaticCapture() }
+                            .font(Typography.secondary)
                     }
                 }
             }
             if !capture.isRecording {
                 Toggle("播放处理与候选一致（仅作备注）", isOn: $model.sharedProcessingDeclared)
-                    .toggleStyle(.checkbox).font(.system(size: 10)).foregroundStyle(Palette.muted)
+                    .toggleStyle(.checkbox)
+                    .font(Typography.secondary)
+                    .foregroundStyle(Palette.muted)
             }
-        }.padding(16).background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
-            .onAppear { model.installPlayerEvents() }
+        }
+        .padding(16)
+        .background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
+        .onAppear { model.installPlayerEvents() }
     }
 
     private var hasExplicitOtherSource: Bool {
