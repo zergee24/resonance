@@ -33,9 +33,13 @@ struct OCRProbe {
 
         try verifyRedBadgeMask(observer)
         try verifyOCRStability()
+        try verifySystemMetadata()
+        try verifyLegacyTrackDecode()
         print("PASS production OCR crop probe: normal=\(cropped.width)x\(cropped.height), small=\(smallCrop.width)x\(smallCrop.height), bottom pixels only")
         print("PASS red VIP badge probe: compact red badge masked, white VIP title pixels retained")
         print("PASS OCR boundaries: single-frame noise ignored, repeated change accepted, pause immediate, stale identity expires")
+        print("PASS system metadata: source-aware keys, opaque IDs, source matching, and system-player priority")
+        print("PASS legacy TrackEntry JSON: optional source metadata decodes as nil")
     }
 
     @MainActor
@@ -124,6 +128,97 @@ struct OCRProbe {
         read(nil, 11)
         read(nil, 12)
         try require(observer.snapshot?.title == "E" && observer.snapshot?.observedAt == Date(timeIntervalSince1970: 10), "missing title replaced or refreshed accepted identity")
+    }
+
+    @MainActor
+    private static func verifySystemMetadata() throws {
+        let observer = PlayerObserver(bundleIdentifiers: [])
+        let opaqueID = "7B5C5A4E-0A8C-4D6A-9A09-2F8D2A4D0F51"
+
+        func makeSnapshot(bundle: String, process: Int32, opaque: String) -> PlayerSnapshot {
+            observer.makeSystemSnapshot(SystemPlayerState(
+                title: "同名歌曲",
+                artist: "同名艺人",
+                duration: 180,
+                currentTime: 12,
+                playing: true,
+                bundleIdentifier: bundle,
+                processIdentifier: process,
+                contentItemIdentifier: opaque
+            ))
+        }
+
+        let base = makeSnapshot(bundle: "com.example.player-a", process: 401, opaque: opaqueID)
+        let otherApp = makeSnapshot(bundle: "com.example.player-b", process: 401, opaque: opaqueID)
+        let otherProcess = makeSnapshot(bundle: "com.example.player-a", process: 402, opaque: opaqueID)
+        let otherItem = makeSnapshot(bundle: "com.example.player-a", process: 401, opaque: "opaque-item-2")
+        let keys = Set([base.candidateKey, otherApp.candidateKey, otherProcess.candidateKey, otherItem.candidateKey])
+        try require(keys.count == 4, "same title from another app, PID, or opaque item must create a new candidate key")
+
+        try require(base.trackID == nil && base.neteaseID == nil && base.trackURL == nil,
+                    "system opaque identity must not become a NetEase track ID or URL")
+        try require(base.systemItemIdentifier == opaqueID, "system opaque identity was not retained")
+        try require(base.candidateKey.contains("system-item:\(opaqueID)"), "candidate key omitted the system opaque identity")
+        try require(!base.candidateKey.contains("netease-id:"), "candidate key treated the opaque identity as a NetEase ID")
+
+        try require(base.matchesSource(bundleIdentifier: "com.example.player-a", processIdentifier: 401),
+                    "matching source bundle and PID was rejected")
+        try require(!base.matchesSource(bundleIdentifier: "com.example.player-b", processIdentifier: 401),
+                    "mismatched source bundle was accepted")
+        try require(!base.matchesSource(bundleIdentifier: "com.example.player-a", processIdentifier: 402),
+                    "mismatched source PID was accepted")
+
+        let earlier = PlayerSnapshot(
+            trackID: nil, trackURL: nil, title: "同名歌曲", artist: "同名艺人", album: nil,
+            currentTime: 12, duration: 180, playbackState: .playing,
+            observedAt: Date(timeIntervalSince1970: 100),
+            metadataSource: .systemPlayer,
+            sourceBundleIdentifier: "com.example.player-a",
+            sourceApplicationName: "Example Player",
+            sourceProcessIdentifier: 401,
+            systemItemIdentifier: opaqueID
+        )
+        let refreshed = PlayerSnapshot(
+            trackID: nil, trackURL: nil, title: "同名歌曲", artist: "同名艺人", album: nil,
+            currentTime: 12, duration: 180, playbackState: .playing,
+            observedAt: Date(timeIntervalSince1970: 200),
+            metadataSource: .systemPlayer,
+            sourceBundleIdentifier: "com.example.player-a",
+            sourceApplicationName: "Example Player",
+            sourceProcessIdentifier: 401,
+            systemItemIdentifier: opaqueID
+        )
+        try require(earlier == refreshed, "observation time alone changed PlayerSnapshot equality")
+
+        observer.publishSnapshot(base)
+        observer.systemSnapshot = base
+        observer.publishStableOCR(PlayerSnapshot(
+            trackID: nil, trackURL: nil, title: "错误 OCR", artist: "错误艺人", album: nil,
+            currentTime: nil, duration: nil, playbackState: .playing,
+            metadataSource: .screenOCR, sourceBundleIdentifier: "com.example.player-a",
+            sourceProcessIdentifier: 401
+        ))
+        try require(observer.snapshot == base, "OCR candidate replaced a fresher system-player snapshot")
+    }
+
+    private static func verifyLegacyTrackDecode() throws {
+        let legacyJSON = Data("""
+        {
+            "id":"E9C7D8A3-15C4-4B74-9EF6-1D31C9A7B3FA",
+            "title":"旧记录",
+            "artist":"旧艺人",
+            "capturedSeconds":0,
+            "isFull":false,
+            "processingState":"播放处理未知",
+            "source":"本地导入",
+            "importedAt":0,
+            "sourceOrder":0,
+            "comparisonAllowed":true
+        }
+        """.utf8)
+        let track = try JSONDecoder().decode(TrackEntry.self, from: legacyJSON)
+        try require(track.sourceBundleIdentifier == nil && track.sourceApplicationName == nil && track.metadataSource == nil,
+                    "legacy TrackEntry JSON invented or failed to default source metadata")
     }
 
     private enum PixelColor: Equatable {

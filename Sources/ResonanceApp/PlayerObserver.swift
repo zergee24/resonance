@@ -23,7 +23,19 @@ public enum PlayerIdentityEvidence: String, Equatable, Codable {
     case unavailable
 }
 
-/// A read-only snapshot of the information exposed by 网易云音乐's native UI.
+public enum PlayerMetadataSource: String, Equatable, Codable {
+    case systemPlayer, accessibility, screenOCR
+
+    public var label: String {
+        switch self {
+        case .systemPlayer: return "系统播放信息"
+        case .accessibility: return "辅助功能"
+        case .screenOCR: return "窗口识别"
+        }
+    }
+}
+
+/// A read-only snapshot from the system player, with native UI fallbacks.
 ///
 /// A snapshot without `trackID` and `trackURL` is a candidate only.  The
 /// observer never creates an ID from a title, artist, duration, or an
@@ -40,6 +52,12 @@ public struct PlayerSnapshot: Equatable {
     public let identityEvidence: PlayerIdentityEvidence
     public let limitations: [String]
     public let observedAt: Date
+    public let metadataSource: PlayerMetadataSource
+    public let sourceBundleIdentifier: String?
+    public let sourceApplicationName: String?
+    public let sourceProcessIdentifier: Int32?
+    /// Opaque system identity, never a NetEase song ID.
+    public let systemItemIdentifier: String?
 
     public init(
         trackID: String?,
@@ -52,7 +70,12 @@ public struct PlayerSnapshot: Equatable {
         playbackState: PlayerPlaybackState,
         identityEvidence: PlayerIdentityEvidence? = nil,
         limitations: [String] = [],
-        observedAt: Date = Date()
+        observedAt: Date = Date(),
+        metadataSource: PlayerMetadataSource = .accessibility,
+        sourceBundleIdentifier: String? = nil,
+        sourceApplicationName: String? = nil,
+        sourceProcessIdentifier: Int32? = nil,
+        systemItemIdentifier: String? = nil
     ) {
         self.trackID = trackID
         self.trackURL = trackURL
@@ -65,6 +88,11 @@ public struct PlayerSnapshot: Equatable {
         self.identityEvidence = identityEvidence ?? PlayerSnapshot.defaultIdentityEvidence(trackID: trackID, trackURL: trackURL)
         self.limitations = limitations
         self.observedAt = observedAt
+        self.metadataSource = metadataSource
+        self.sourceBundleIdentifier = sourceBundleIdentifier
+        self.sourceApplicationName = sourceApplicationName
+        self.sourceProcessIdentifier = sourceProcessIdentifier
+        self.systemItemIdentifier = systemItemIdentifier
     }
 
     /// True when the UI supplied only metadata and the track cannot yet be
@@ -91,9 +119,19 @@ public struct PlayerSnapshot: Equatable {
     /// Stable enough for UI lists while still making two unbound candidates
     /// with different metadata distinct.  It is not a platform identity.
     public var candidateKey: String {
-        if let trackID { return "netease-id:\(trackID)" }
-        if let trackURL { return "netease-url:\(trackURL.absoluteString)" }
-        return "candidate:\(title ?? "")|\(artist ?? "")|\(album ?? "")"
+        let source = "\(metadataSource.rawValue)|\(sourceBundleIdentifier ?? "")|\(sourceProcessIdentifier.map(String.init) ?? "")"
+        if let trackID { return "\(source)|netease-id:\(trackID)" }
+        if let trackURL { return "\(source)|netease-url:\(trackURL.absoluteString)" }
+        if let systemItemIdentifier { return "\(source)|system-item:\(systemItemIdentifier)" }
+        return "\(source)|candidate:\(title ?? "")|\(artist ?? "")|\(album ?? "")"
+    }
+
+    /// Source attribution must agree with the process whose PCM will be tapped.
+    public func matchesSource(bundleIdentifier: String?, processIdentifier: Int32) -> Bool {
+        guard sourceBundleIdentifier != nil || sourceProcessIdentifier != nil else { return false }
+        if let sourceBundleIdentifier, sourceBundleIdentifier != bundleIdentifier { return false }
+        if let sourceProcessIdentifier, sourceProcessIdentifier != processIdentifier { return false }
+        return true
     }
 
     public static func == (lhs: PlayerSnapshot, rhs: PlayerSnapshot) -> Bool {
@@ -106,7 +144,12 @@ public struct PlayerSnapshot: Equatable {
             lhs.duration == rhs.duration &&
             lhs.playbackState == rhs.playbackState &&
             lhs.identityEvidence == rhs.identityEvidence &&
-            lhs.limitations == rhs.limitations
+            lhs.limitations == rhs.limitations &&
+            lhs.metadataSource == rhs.metadataSource &&
+            lhs.sourceBundleIdentifier == rhs.sourceBundleIdentifier &&
+            lhs.sourceApplicationName == rhs.sourceApplicationName &&
+            lhs.sourceProcessIdentifier == rhs.sourceProcessIdentifier &&
+            lhs.systemItemIdentifier == rhs.systemItemIdentifier
     }
 
     private static func defaultIdentityEvidence(trackID: String?, trackURL: URL?) -> PlayerIdentityEvidence {
@@ -135,7 +178,7 @@ public enum PlayerObserverStatus: Equatable {
         case .needsScreenCapture:
             return "屏幕读取备选需要在系统设置中允许屏幕录制"
         case .observing:
-            return "已读取网易云当前播放信息"
+            return "已读取当前播放信息"
         case let .limitedMetadata(reason):
             return reason
         }
@@ -152,10 +195,8 @@ public enum PlayerObserverEvent: Equatable {
     case metadataUpdated(PlayerSnapshot)
 }
 
-/// Reads the native 网易云音乐 application through the macOS Accessibility
-/// API.  It deliberately does not use MediaRemote, a private player database,
-/// or AppleScript.  Screen capture and OCR are available only through the
-/// separate, explicit `enableScreenCaptureFallback()` opt-in.
+/// Reads macOS Now Playing first. Accessibility and explicitly enabled OCR
+/// remain fallbacks when the system service has no current track.
 @MainActor
 public final class PlayerObserver: ObservableObject {
     public nonisolated static let defaultBundleIdentifiers = [
@@ -164,6 +205,7 @@ public final class PlayerObserver: ObservableObject {
         "com.netease.163music.desktop"
     ]
 
+    @Published public private(set) var systemPlayerIssue: String?
     @Published public private(set) var snapshot: PlayerSnapshot?
     @Published public private(set) var permissionNeeded = false
     @Published public private(set) var screenCapturePermissionNeeded = false
@@ -174,12 +216,24 @@ public final class PlayerObserver: ObservableObject {
     /// Called on the main actor after a meaningful accessible-UI change.
     public var eventHandler: ((PlayerObserverEvent) -> Void)?
 
-    /// The currently running player's PID, when it can be located.  This
-    /// uses the same bundle-ID and visible-name lookup as observation, so a
-    /// caller can resolve the recording target without starting polling.
+    /// Recording remains scoped to NetEase, even when another system player
+    /// owns Now Playing. Validate both supplied source identifiers against it.
     public var processIdentifier: pid_t? {
-        locatePlayer()?.processIdentifier
+        guard let application = locatePlayer() else { return nil }
+        if let snapshot, snapshot.metadataSource == .systemPlayer {
+            guard snapshot.matchesSource(bundleIdentifier: application.bundleIdentifier,
+                                         processIdentifier: application.processIdentifier) else { return nil }
+        }
+        return application.processIdentifier
     }
+
+    public var canCaptureCurrentSource: Bool { processIdentifier != nil }
+
+    private let systemReader: SystemPlayerReader
+    private var systemPlayerTask: Task<Void, Never>?
+    private var systemSnapshot: PlayerSnapshot?
+    private var didReadSystemPlayer = false
+    private var observationGeneration = UUID()
 
     private let bundleIdentifiers: [String]
     private let pollingInterval: TimeInterval
@@ -193,27 +247,31 @@ public final class PlayerObserver: ObservableObject {
 
     public init(
         bundleIdentifiers: [String] = PlayerObserver.defaultBundleIdentifiers,
-        pollingInterval: TimeInterval = 0.6
+        pollingInterval: TimeInterval = 0.6,
+        systemReader: SystemPlayerReader = SystemPlayerReader()
     ) {
+        self.systemReader = systemReader
         self.bundleIdentifiers = bundleIdentifiers
         self.pollingInterval = max(0.2, pollingInterval)
     }
 
     deinit {
         timer?.invalidate()
+        systemPlayerTask?.cancel()
+        systemReader.cancel()
         screenCaptureTask?.cancel()
     }
 
     public func start() {
         guard !isObserving else {
-            restoreScreenCaptureFallbackIfPermitted()
             refresh()
             return
         }
 
         isObserving = true
-        restoreScreenCaptureFallbackIfPermitted()
-        refresh()
+        didReadSystemPlayer = false
+        observationGeneration = UUID()
+        startSystemPlayerLoop()
         timer = Timer.scheduledTimer(withTimeInterval: pollingInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
@@ -226,6 +284,13 @@ public final class PlayerObserver: ObservableObject {
         pendingOCRKey = nil
         pendingOCRObservedAt = nil
         isObserving = false
+        observationGeneration = UUID()
+        systemPlayerTask?.cancel()
+        systemPlayerTask = nil
+        systemReader.cancel()
+        systemSnapshot = nil
+        systemPlayerIssue = nil
+        didReadSystemPlayer = false
         timer?.invalidate()
         timer = nil
         screenCaptureTask?.cancel()
@@ -242,6 +307,22 @@ public final class PlayerObserver: ObservableObject {
     /// sends an action to 网易云音乐.
     @discardableResult
     public func refresh() -> PlayerSnapshot? {
+        if let systemSnapshot, Date().timeIntervalSince(systemSnapshot.observedAt) <= 3 {
+            permissionNeeded = false
+            screenCapturePermissionNeeded = false
+            screenCaptureTask?.cancel()
+            screenCaptureTask = nil
+            pendingOCRKey = nil
+            pendingOCRObservedAt = nil
+            publishSnapshot(systemSnapshot)
+            status = .observing
+            return systemSnapshot
+        }
+        // Wait for the first system query before asking for fallback permissions.
+        guard !isObserving || didReadSystemPlayer else { return snapshot }
+        systemSnapshot = nil
+        if snapshot?.metadataSource == .systemPlayer { publishSnapshot(nil) }
+        restoreScreenCaptureFallbackIfPermitted()
         guard let application = locatePlayer() else {
             pendingOCRKey = nil
             pendingOCRObservedAt = nil
@@ -295,7 +376,7 @@ public final class PlayerObserver: ObservableObject {
             publishSnapshot(nil)
             status = screenCaptureFallbackEnabled && screenCapturePermissionNeeded
                 ? .needsScreenCapture
-                : .limitedMetadata(reason: "网易云当前页面没有通过标准辅助功能暴露歌曲元数据；未使用屏幕读取或私有接口")
+                : .limitedMetadata(reason: "系统未提供当前歌曲；网易云当前页面也未暴露辅助功能元数据")
             return nil
         }
 
@@ -309,7 +390,11 @@ public final class PlayerObserver: ObservableObject {
             duration: metadata.duration,
             playbackState: metadata.playbackState,
             identityEvidence: metadata.identityEvidence,
-            limitations: metadata.limitations
+            limitations: metadata.limitations,
+            metadataSource: .accessibility,
+            sourceBundleIdentifier: application.bundleIdentifier,
+            sourceApplicationName: application.localizedName,
+            sourceProcessIdentifier: application.processIdentifier
         )
         publishSnapshot(next)
 
@@ -320,6 +405,47 @@ public final class PlayerObserver: ObservableObject {
             ? .observing
             : .limitedMetadata(reason: limitations.joined(separator: "；"))
         return next
+    }
+
+    private func startSystemPlayerLoop() {
+        let generation = observationGeneration
+        systemPlayerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                var state: SystemPlayerState?
+                var issue: String?
+                do { state = try await self.systemReader.read() }
+                catch { issue = error.localizedDescription }
+                guard !Task.isCancelled, self.isObserving,
+                      self.observationGeneration == generation else { return }
+                self.systemPlayerIssue = issue
+                self.didReadSystemPlayer = true
+                // A single failed query may reuse the last successful sample
+                // only within the same three-second freshness window.
+                if let state { self.systemSnapshot = self.makeSystemSnapshot(state) }
+                else if issue == nil { self.systemSnapshot = nil }
+                self.refresh()
+                do { try await Task.sleep(nanoseconds: 800_000_000) }
+                catch { return }
+            }
+        }
+    }
+
+    private func makeSystemSnapshot(_ state: SystemPlayerState) -> PlayerSnapshot {
+        let application = state.processIdentifier.flatMap { NSRunningApplication(processIdentifier: $0) }
+            ?? state.bundleIdentifier.flatMap {
+                NSRunningApplication.runningApplications(withBundleIdentifier: $0).first
+            }
+        return PlayerSnapshot(
+            trackID: nil, trackURL: nil, title: state.title, artist: state.artist, album: state.album,
+            currentTime: state.currentTime, duration: state.duration,
+            playbackState: state.playing.map { $0 ? .playing : .paused } ?? .unknown,
+            metadataSource: .systemPlayer,
+            sourceBundleIdentifier: state.bundleIdentifier ?? application?.bundleIdentifier,
+            sourceApplicationName: application?.localizedName ?? state.bundleIdentifier,
+            sourceProcessIdentifier: state.processIdentifier ?? application?.processIdentifier,
+            systemItemIdentifier: state.contentItemIdentifier
+        )
     }
 
     /// Opens the system Accessibility settings prompt only when explicitly
@@ -352,6 +478,7 @@ public final class PlayerObserver: ObservableObject {
     public func enableScreenCaptureFallback() -> Bool {
         UserDefaults.standard.set(true, forKey: Self.screenCaptureFallbackPreferenceKey)
         screenCaptureFallbackEnabled = true
+        if systemSnapshot != nil { return true }
 
         guard CGPreflightScreenCaptureAccess() else {
             screenCapturePermissionNeeded = true
@@ -809,7 +936,7 @@ public final class PlayerObserver: ObservableObject {
     }
 
     private func startScreenCaptureLoop() {
-        guard screenCaptureTask == nil else { return }
+        guard screenCaptureTask == nil, systemSnapshot == nil else { return }
         screenCaptureTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -824,7 +951,7 @@ public final class PlayerObserver: ObservableObject {
     }
 
     private func captureOCROnce() async {
-        guard screenCaptureFallbackEnabled,
+        guard systemSnapshot == nil, screenCaptureFallbackEnabled,
               !screenCapturePermissionNeeded,
               let application = locatePlayer() else { return }
 
@@ -856,6 +983,7 @@ public final class PlayerObserver: ObservableObject {
                 contentFilter: filter,
                 configuration: configuration
             )
+            guard !Task.isCancelled, systemSnapshot == nil else { return }
             guard let bottomBar = cropBottomBar(from: image, scale: scale) else {
                 updateScreenCaptureLimitation("网易云窗口没有可读取的底部播放区域")
                 return
@@ -868,7 +996,7 @@ public final class PlayerObserver: ObservableObject {
                 updateScreenCaptureLimitation("屏幕读取未识别到网易云底部播放信息")
                 return
             }
-            guard screenCaptureFallbackEnabled, !Task.isCancelled else { return }
+            guard systemSnapshot == nil, screenCaptureFallbackEnabled, !Task.isCancelled else { return }
             mergeOCR(ocr, transportState: exposedMenuPlaybackState(application))
         } catch {
             updateScreenCaptureLimitation("网易云窗口屏幕读取失败：\(error.localizedDescription)")
@@ -1035,6 +1163,8 @@ public final class PlayerObserver: ObservableObject {
     }
 
     private func mergeOCR(_ ocr: OCRMetadata, transportState: PlayerPlaybackState = .unknown) {
+        guard systemSnapshot == nil else { return }
+        let application = locatePlayer()
         // OCR is a candidate source only.  It cannot establish that the
         // current text belongs to the same platform track as the previous
         // snapshot, so do not carry over any identity or partially
@@ -1066,13 +1196,18 @@ public final class PlayerObserver: ObservableObject {
             duration: duration,
             playbackState: playbackState,
             identityEvidence: .candidate,
-            limitations: limitations
+            limitations: limitations,
+            metadataSource: .screenOCR,
+            sourceBundleIdentifier: application?.bundleIdentifier,
+            sourceApplicationName: application?.localizedName,
+            sourceProcessIdentifier: application?.processIdentifier
         )
         publishStableOCR(next)
         status = .limitedMetadata(reason: limitations.joined(separator: "；"))
     }
 
     private func publishStableOCR(_ next: PlayerSnapshot) {
+        guard systemSnapshot == nil else { return }
         let previous = snapshot.flatMap { $0.identityEvidence == .candidate ? $0 : nil }
         let hasTitle = !(next.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let repeatsPending = hasTitle && pendingOCRKey == next.candidateKey &&
@@ -1097,7 +1232,11 @@ public final class PlayerObserver: ObservableObject {
             currentTime: nil, duration: previous.duration,
             playbackState: next.playbackState == .playing ? previous.playbackState : next.playbackState,
             identityEvidence: .candidate,
-            limitations: previous.limitations, observedAt: previous.observedAt
+            limitations: previous.limitations, observedAt: previous.observedAt,
+            metadataSource: previous.metadataSource,
+            sourceBundleIdentifier: previous.sourceBundleIdentifier,
+            sourceApplicationName: previous.sourceApplicationName,
+            sourceProcessIdentifier: previous.sourceProcessIdentifier
         ))
     }
 

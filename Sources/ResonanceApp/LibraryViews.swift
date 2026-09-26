@@ -76,6 +76,20 @@ struct TrackLibraryRow: View {
                 if track.analyzed && track.sourcePlaylistID == nil { Button("用于歌单曲目") { showPlaylistBinding = true }.font(.caption) }
                 Button(track.neteaseID == nil ? "绑定歌曲链接" : "查看绑定") { bindingURL = track.neteaseID.map { "https://music.163.com/song?id=\($0)" } ?? ""; identityConfirmed = false; showBinding.toggle() }.font(.caption)
             }
+            if let application = track.sourceApplicationName?.trimmingCharacters(in: .whitespacesAndNewlines), !application.isEmpty {
+                HStack(spacing: 5) {
+                    Image(systemName: "app.badge").font(.caption2)
+                    Text("来源：\(application)")
+                    if let bundleID = track.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleID.isEmpty {
+                        Text(bundleID).font(.caption2).lineLimit(1).truncationMode(.middle).help("来源 Bundle ID")
+                    }
+                }.font(.caption2).foregroundStyle(Palette.muted)
+            } else if let bundleID = track.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleID.isEmpty {
+                HStack(spacing: 5) {
+                    Image(systemName: "app.badge").font(.caption2)
+                    Text("来源 Bundle：\(bundleID)").lineLimit(1).truncationMode(.middle)
+                }.font(.caption2).foregroundStyle(Palette.muted)
+            }
             if showBinding {
                 HStack {
                     TextField("对应录音的网易云歌曲链接", text: $bindingURL)

@@ -17,6 +17,20 @@ for resource in "$binary_dir"/*.bundle(N); do
   ditto "$resource" "$bundle/Contents/Resources/${resource:t}"
 done
 
+# The MediaRemote helper is a nested arm64 code resource.  Keep its launcher,
+# binary, and BSD-3-Clause notice together so the app can use absolute paths at
+# runtime and ship the required attribution with the bundle.
+system_player_dir="$bundle/Contents/Resources/SystemPlayer"
+mkdir -p "$system_player_dir"
+for resource in "$PWD"/Support/SystemPlayer/*(N); do
+  cp "$resource" "$system_player_dir/${resource:t}"
+done
+if [[ ! -f "$system_player_dir/MediaRemoteMini.dylib" ]]; then
+  print -u2 "missing SystemPlayer/MediaRemoteMini.dylib"
+  exit 1
+fi
+codesign --force --sign - --identifier local.tony.Resonance.MediaRemoteMini "$system_player_dir/MediaRemoteMini.dylib"
+
 # Build the native macOS icon from one transparent PNG source. iconutil is
 # part of Xcode Command Line Tools and keeps the release bundle dependency-free.
 iconset_parent="$(mktemp -d "${TMPDIR:-/tmp}/resonance-iconset.XXXXXX")"

@@ -10,6 +10,8 @@ sed -i '' 's/private func cropBottomBar/func cropBottomBar/' "$probe_dir/PlayerO
 sed -i '' 's/private func suppressRedBadgePixels/func suppressRedBadgePixels/' "$probe_dir/PlayerObserver.swift"
 sed -i '' 's/private func publishStableOCR/func publishStableOCR/' "$probe_dir/PlayerObserver.swift"
 sed -i '' 's/private func publishSnapshot/func publishSnapshot/' "$probe_dir/PlayerObserver.swift"
+sed -i '' 's/private var systemSnapshot/var systemSnapshot/' "$probe_dir/PlayerObserver.swift"
+sed -i '' 's/private func makeSystemSnapshot/func makeSystemSnapshot/' "$probe_dir/PlayerObserver.swift"
 swiftc -parse-as-library \
   -framework AppKit \
   -framework ApplicationServices \
@@ -17,6 +19,8 @@ swiftc -parse-as-library \
   -framework ScreenCaptureKit \
   -framework Vision \
   "$probe_dir/PlayerObserver.swift" \
+  "$repo_root/Sources/ResonanceApp/SystemPlayerReader.swift" \
+  "$repo_root/Sources/ResonanceApp/LibraryModels.swift" \
   "$repo_root/Tests/PlayerProbe/OCRProbe.swift" \
   -o "$probe_dir/player-ocr-probe"
 "$probe_dir/player-ocr-probe"

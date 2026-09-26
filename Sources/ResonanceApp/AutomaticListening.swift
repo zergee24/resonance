@@ -64,7 +64,13 @@ extension AppModel {
     func syncFollowedPlayback() {
         guard isFollowPlaying,
               let snapshot = player.snapshot,
-              Date().timeIntervalSince(snapshot.observedAt) <= 3 else { return }
+              Date().timeIntervalSince(snapshot.observedAt) <= 3,
+              player.canCaptureCurrentSource else {
+            if isFollowPlaying, !player.canCaptureCurrentSource {
+                selectedTrackID = nil
+            }
+            return
+        }
         selectFollowedCache(for: snapshot)
     }
 
@@ -75,14 +81,41 @@ extension AppModel {
         let snapshot = player.snapshot.flatMap { Date().timeIntervalSince($0.observedAt) <= 3 ? $0 : nil }
         // Keep the observer independent of the currently visible page. Losing
         // identity is a recording boundary even when no player event arrives.
+        if snapshot != nil, captureIdentity != nil, !player.canCaptureCurrentSource {
+            cancelCaptureStart()
+            finishCapture(boundaryNote: "当前播放来源已不是网易云，录音在来源边界处结束。")
+        }
         if snapshot == nil, captureIdentity != nil, capture.isRecording {
             finishCapture(boundaryNote: "歌曲身份不可用，按已录内容估计。")
         }
-        if snapshot == nil, captureIdentity != nil, captureRequestID != nil { cancelCaptureStart() }
+        if snapshot == nil, captureIdentity != nil, captureRequestID != nil {
+            cancelCaptureStart()
+        }
         guard automaticListeningEnabled else { return }
         let usableIdentity = snapshot.flatMap { value -> PlayerSnapshot? in
             guard value.trackID != nil || !(value.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return value
+        }
+
+        // System Now Playing is useful for the current-player panel, but its
+        // metadata must never become a history row or drive a 网易云 capture.
+        // Only the observer's verified source/PID match permits automatic
+        // recording.  Reset the previous automatic session once when the
+        // source leaves 网易云 so a later return cannot reuse its recording ID.
+        if let snapshot = usableIdentity, !player.canCaptureCurrentSource {
+            let hadAutomaticSession = captureIsAutomatic || captureRequestID != nil ||
+                automaticHistorySessionID != nil || automaticHistoryTrackID != nil
+            if hadAutomaticSession {
+                cancelCaptureStart()
+                if capture.isRecording {
+                    finishCapture(boundaryNote: "当前播放来源不是网易云，自动采集已结束。")
+                }
+                automaticHistorySessionID = nil
+                automaticHistoryTrackID = nil
+                automaticListeningPolicy.resetForDiscontinuity()
+            }
+            automaticListeningStatus = "当前来源：\(sourceLabel(for: snapshot))；仅显示系统播放信息，未自动采集"
+            return
         }
         let observation = automaticListeningPolicy.update(
             key: usableIdentity?.candidateKey,
@@ -103,12 +136,17 @@ extension AppModel {
         }
         if automaticHistorySessionID != sessionID {
             let cachedTrack = latestAnalyzedTrack(for: snapshot.trackID)
-            let track = TrackEntry(
+            var track = TrackEntry(
                 title: snapshot.title ?? "网易云 \(snapshot.trackID ?? "未识别歌曲")",
                 artist: snapshot.artist ?? "", neteaseID: snapshot.trackID,
                 sourceURL: snapshot.trackURL?.absoluteString, duration: snapshot.duration,
-                source: snapshot.isCandidate ? "自动听歌记录 · 候选身份" : "自动听歌记录"
+                source: "自动听歌记录"
             )
+            track.sourceBundleIdentifier = snapshot.sourceBundleIdentifier
+            track.sourceApplicationName = snapshot.sourceApplicationName
+            track.metadataSource = snapshot.metadataSource.rawValue
+            track.sourceProcessID = snapshot.sourceProcessIdentifier
+            track.mediaStartSeconds = snapshot.currentTime
             do {
                 try saveTrack(track)
                 automaticHistorySessionID = sessionID
@@ -177,7 +215,10 @@ extension AppModel {
     }
 
     private func selectFollowedCache(for snapshot: PlayerSnapshot) {
-        guard isFollowPlaying else { return }
+        guard isFollowPlaying, player.canCaptureCurrentSource else {
+            if isFollowPlaying { selectedTrackID = nil }
+            return
+        }
         guard let cachedTrack = latestAnalyzedTrack(for: snapshot.trackID) else {
             selectedTrackID = nil
             return
@@ -194,5 +235,15 @@ extension AppModel {
         return tracks
             .filter { $0.analyzed && $0.neteaseID?.trimmingCharacters(in: .whitespacesAndNewlines) == trackID }
             .max { $0.importedAt < $1.importedAt }
+    }
+
+    private func sourceLabel(for snapshot: PlayerSnapshot) -> String {
+        if let application = snapshot.sourceApplicationName?.trimmingCharacters(in: .whitespacesAndNewlines), !application.isEmpty {
+            return application
+        }
+        if let bundle = snapshot.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundle.isEmpty {
+            return bundle
+        }
+        return snapshot.metadataSource.label
     }
 }

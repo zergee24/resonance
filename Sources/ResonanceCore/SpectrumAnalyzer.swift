@@ -216,11 +216,17 @@ public struct SpectrumAnalyzer: Sendable {
 
         var channels = Array(repeating: [Float](), count: channelCount)
         let chunkCapacity: AVAudioFrameCount = 65_536
-        while true {
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: chunkCapacity) else {
+        var remainingFrames = file.length
+        while remainingFrames > 0 {
+            let requestedFrames = AVAudioFrameCount(min(Int64(chunkCapacity), remainingFrames))
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: requestedFrames) else {
                 throw ResonanceCoreError.invalidAudioFormat
             }
-            try file.read(into: buffer, frameCount: chunkCapacity)
+            // AVAudioFile can throw Foundation._GenericObjCError(nilError)
+            // when an exact chunk-aligned file is read once more at EOF.
+            // Bound each request by the advertised file length so the final
+            // full chunk terminates the loop without probing past the file.
+            try file.read(into: buffer, frameCount: requestedFrames)
             let frameCount = Int(buffer.frameLength)
             if frameCount == 0 { break }
             guard let channelData = buffer.floatChannelData else {
@@ -230,7 +236,8 @@ public struct SpectrumAnalyzer: Sendable {
                 let values = UnsafeBufferPointer(start: channelData[channel], count: frameCount)
                 channels[channel].append(contentsOf: values)
             }
-            if frameCount < Int(chunkCapacity) { break }
+            remainingFrames -= AVAudioFramePosition(frameCount)
+            if frameCount < Int(requestedFrames) { break }
         }
 
         guard let firstCount = channels.first?.count, firstCount > 0,

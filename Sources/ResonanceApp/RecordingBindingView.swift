@@ -71,6 +71,20 @@ struct RecordingBindingView: View {
                     Text(recording.artist.isEmpty ? "艺人未知" : recording.artist)
                         .font(.system(size: 12))
                         .foregroundStyle(Palette.muted)
+                    if let application = recording.sourceApplicationName?.trimmingCharacters(in: .whitespacesAndNewlines), !application.isEmpty {
+                        HStack(spacing: 5) {
+                            Image(systemName: "app.badge").font(.caption2)
+                            Text("来源：\(application)")
+                            if let bundleID = recording.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleID.isEmpty {
+                                Text(bundleID).font(.caption2).lineLimit(1).truncationMode(.middle).help("来源 Bundle ID")
+                            }
+                        }.font(.caption2).foregroundStyle(Palette.muted)
+                    } else if let bundleID = recording.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleID.isEmpty {
+                        HStack(spacing: 5) {
+                            Image(systemName: "app.badge").font(.caption2)
+                            Text("来源 Bundle：\(bundleID)").lineLimit(1).truncationMode(.middle)
+                        }.font(.caption2).foregroundStyle(Palette.muted)
+                    }
                     HStack(spacing: 8) {
                         TinyBadge(text: recording.analyzed ? "已有频谱分析" : "尚未完成分析", color: recording.analyzed ? Palette.accent : .orange)
                         if let sampleRate = recording.sampleRate {
@@ -253,6 +267,9 @@ extension AppModel {
         target.contentSHA256 = recording.contentSHA256
         target.droppedFrames = recording.droppedFrames
         target.sourceProcessID = recording.sourceProcessID
+        target.sourceBundleIdentifier = recording.sourceBundleIdentifier
+        target.sourceApplicationName = recording.sourceApplicationName
+        target.metadataSource = recording.metadataSource
         target.error = recording.error
         target.analysisNotes = recording.analysisNotes
 

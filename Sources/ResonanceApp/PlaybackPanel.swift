@@ -20,8 +20,29 @@ struct PlaybackContents: View {
                     Image(systemName: capture.isRecording ? "waveform" : "play.rectangle").foregroundStyle(Palette.accent)
                 }
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(player.snapshot?.title ?? "网易云 · 当前播放").font(.system(size: 13, weight: .medium))
+                    Text(player.snapshot?.title ?? "当前系统播放").font(.system(size: 13, weight: .medium))
                     Text(player.snapshot?.artist ?? player.status.message).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(2)
+                    if let snapshot = player.snapshot {
+                        HStack(spacing: 5) {
+                            Text("来源：\(sourceLabel(for: snapshot)) · \(snapshot.metadataSource.label)")
+                            if let bundleID = snapshot.sourceBundleIdentifier, !bundleID.isEmpty {
+                                Text(bundleID).lineLimit(1).truncationMode(.middle)
+                            }
+                            if let processID = snapshot.sourceProcessIdentifier {
+                                Text("PID \(processID)")
+                            }
+                        }
+                        .font(.system(size: 10))
+                        .foregroundStyle(Palette.muted)
+                        if let currentTime = snapshot.currentTime, let duration = snapshot.duration, duration > 0 {
+                            HStack(spacing: 7) {
+                                ProgressView(value: min(max(currentTime / duration, 0), 1))
+                                Text("\(durationLabel(currentTime)) / \(durationLabel(duration))")
+                                    .font(.system(size: 10, design: .monospaced))
+                            }
+                            .foregroundStyle(Palette.muted)
+                        }
+                    }
                 }
                 Spacer()
                 if capture.isRecording {
@@ -36,17 +57,26 @@ struct PlaybackContents: View {
                         .help("停止当前连续段；自动积累保持开启，下一次切歌或暂停后恢复播放时继续。")
                 } else {
                     Button("读取当前歌曲") { player.start(); player.refresh() }
-                    Button("采集网易云音频", systemImage: "record.circle") { model.beginCapture() }.disabled(model.busy || capture.status == .starting)
+                    Button("采集网易云音频", systemImage: "record.circle") { model.beginCapture() }
+                        .disabled(model.busy || capture.status == .starting || hasExplicitOtherSource)
+                        .help(hasExplicitOtherSource ? "当前系统播放来源不是网易云" : "采集网易云当前播放音频")
                 }
             }
             HStack(spacing: 12) {
                 if player.permissionNeeded { Button("允许辅助功能") { _ = player.requestAccessibilityPermission() } }
                 if !player.screenCaptureFallbackEnabled { Button("启用窗口识别备选") { _ = player.enableScreenCaptureFallback() } }
                 else { Button("关闭窗口识别") { player.disableScreenCaptureFallback() } }
-                if player.snapshot?.isCandidate == true { TinyBadge(text: "候选身份 · 未取得精确歌曲 ID", color: .orange) }
+                if player.snapshot?.isCandidate == true { TinyBadge(text: "未关联网易云 ID", color: .orange) }
+                if hasExplicitOtherSource { TinyBadge(text: "当前来源不采集", color: .orange) }
                 Spacer()
-                Text(capture.isRecording ? "只采集网易云进程 · 本地保存" : "音频采集与歌曲识别可分别使用").font(.system(size: 10)).foregroundStyle(Palette.muted)
+                Text(capture.isRecording ? "只采集网易云进程 · 本地保存" : (hasExplicitOtherSource ? "仅显示系统播放信息" : "音频采集与歌曲识别可分别使用"))
+                    .font(.system(size: 10)).foregroundStyle(Palette.muted)
             }.font(.system(size: 10)).buttonStyle(.link)
+            if let issue = player.systemPlayerIssue,
+               player.snapshot?.metadataSource != .systemPlayer {
+                Text("系统播放器读取失败：\(issue)；可使用辅助功能或窗口识别")
+                    .font(.system(size: 10)).foregroundStyle(.orange)
+            }
             if case .failed(let message) = capture.status {
                 HStack {
                     Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
@@ -62,11 +92,37 @@ struct PlaybackContents: View {
         }.padding(16).background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
             .onAppear { model.installPlayerEvents() }
     }
+
+    private var hasExplicitOtherSource: Bool {
+        guard let snapshot = player.snapshot,
+              let bundleID = snapshot.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !bundleID.isEmpty else { return false }
+        return !player.canCaptureCurrentSource
+    }
+
+    private func sourceLabel(for snapshot: PlayerSnapshot) -> String {
+        if let application = snapshot.sourceApplicationName?.trimmingCharacters(in: .whitespacesAndNewlines), !application.isEmpty {
+            return application
+        }
+        return "当前来源"
+    }
 }
 
 extension AppModel {
     func beginCapture(automatically: Bool = false, trackID: UUID? = nil) {
         guard (automatically || !busy), !capture.isRecording, captureStartTask == nil, !isShuttingDown, let database else { return }
+        if automatically && !player.canCaptureCurrentSource {
+            automaticListeningStatus = "当前来源不是网易云，等待网易云播放"
+            return
+        }
+        if !automatically,
+           let snapshot = player.snapshot,
+           let bundleID = snapshot.sourceBundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !bundleID.isEmpty,
+           !player.canCaptureCurrentSource {
+            errorMessage = "当前系统播放来源不是网易云，请先切换到网易云音乐。"
+            return
+        }
         guard let processID = player.processIdentifier else {
             if automatically { automaticListeningStatus = "网易云进程已退出，等待播放器重新打开" }
             else { errorMessage = "请先打开网易云音乐并播放要分析的歌曲。" }
@@ -96,15 +152,22 @@ extension AppModel {
                     return
                 }
                 captureRequestID = nil
-                captureIdentity = player.snapshot
-                if let beforeStart, let afterStart = player.snapshot, beforeStart.candidateKey != afterStart.candidateKey {
+                let afterStart = player.snapshot
+                if let beforeStart, let afterStart, beforeStart.candidateKey != afterStart.candidateKey {
                     finishCapture(boundaryNote: "采集启动期间曲目变化，按已录内容估计。")
+                    return
+                }
+                if let afterStart,
+                   afterStart.sourceBundleIdentifier != nil,
+                   !player.canCaptureCurrentSource {
+                    finishCapture(boundaryNote: "采集启动期间检测到当前来源不是网易云，按已录内容估计。")
                     return
                 }
                 if automatically && player.snapshot?.playbackState != .playing {
                     finishCapture(boundaryNote: "采集启动期间播放停止，按已录内容估计。")
                     return
                 }
+                captureIdentity = afterStart ?? beforeStart
                 status = "正在连续采集实际播放内容；覆盖不足的录音会保留为片段。"
             } catch {
                 captureRequestID = nil
@@ -136,7 +199,9 @@ extension AppModel {
         let stoppedAt = Date()
         var notes = ["已录 \(String(format: "%.1f", summary.duration)) 秒；完整度未知，按片段估计。"]
         if let boundaryNote { notes.append(boundaryNote) }
-        if identity?.trackID == nil { notes.append("歌曲身份仅为候选，按已录内容估计。") }
+        if identity?.trackID == nil {
+            notes.append(identity?.metadataSource == .systemPlayer ? "歌曲信息来自系统播放器，尚未关联网易云 ID。" : "歌曲身份仅为候选，按已录内容估计。")
+        }
         if processingDeclared {
             notes.append("用户备注：播放处理与候选一致。")
         } else {
@@ -149,7 +214,7 @@ extension AppModel {
             notes.append("样本较短，按已录内容估计。")
         }
         if let mediaStart = identity?.currentTime {
-            notes.append("播放器界面位置约 \(String(format: "%.1f", mediaStart)) 秒，仅作备注。")
+            notes.append("播放器报告位置约 \(String(format: "%.1f", mediaStart)) 秒，仅作备注。")
         }
         var track = TrackEntry(title: identity?.title ?? "未识别片段 \(stoppedAt.formatted(date: .omitted, time: .shortened))", artist: identity?.artist ?? "", neteaseID: identity?.trackID, sourceURL: identity?.trackURL?.absoluteString, audioPath: summary.destination.path, duration: identity?.duration, capturedSeconds: summary.duration, sampleRate: summary.sampleRate, channels: summary.channelCount, isFull: false, processingState: "音频已保存，等待分析", source: automatic ? "自动听歌采集" : "网易云进程采集")
         if let storedID { track.id = storedID }
@@ -158,6 +223,9 @@ extension AppModel {
         track.wallClockStartedAt = wallClockStart
         track.droppedFrames = summary.droppedFrames
         track.sourceProcessID = processID
+        track.sourceBundleIdentifier = identity?.sourceBundleIdentifier
+        track.sourceApplicationName = identity?.sourceApplicationName
+        track.metadataSource = identity?.metadataSource.rawValue
         // Persist before analysis so quitting or a numerical failure cannot
         // erase the history entry or leave an unreferenced successful capture.
         do { try saveTrack(track) } catch { report(error); return }

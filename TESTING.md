@@ -1,6 +1,19 @@
-# 本机验证记录 · 0.2.5
+# 本机验证记录 · 0.2.6
 
 日期：2026-09-25—2026-09-26。macOS 26.6.2，Apple Silicon，Swift 6.3.3，部署目标 macOS 14.2。各版本证据分列如下。
+
+## 0.2.6 系统播放器接入
+
+- 复用 dsh 插件的 MediaRemoteMini 只读桥接。正式应用读取完整歌名、艺人、专辑、进度、来源 Bundle ID / PID；系统路径无须辅助功能或窗口 OCR，旧系统仍可用备选。二进制与 BSD-3-Clause 许可证随包分发。
+- `verify-system-player.sh` 通过解码、空状态、可选进度、来源、超时与输出上限检查，以及本机暂停网易云读取。`verify-player-ocr.sh` 通过来源隔离、不透明 UUID 不冒充歌曲 ID、系统优先不被 OCR 覆盖、旧 JSON 兼容及原 OCR 检查。自动积累策略 21 项检查通过。
+- 系统元数据与下列两段录音初测使用 0.2.6 build 9，SHA-256 `cbe97f3fda4ca108e5e792aad95cc6095c2da0ceb82eccfd55d0cb2bec0a28d5`。EOF 修复后的最终同版 Release SHA-256 为 `31cc22bd8480e5f09f8883dc089c98ff8e85d653dc0c4522a7c271209e5b2e2e`；构建、外层 App 与内嵌 dylib 签名检查通过。
+- 正式 UI 读到 `With an Orchid / Yanni`、`1:04 / 5:07`、网易云音乐、`com.netease.163music`、PID 896。切到旧 OCR 失败的歌曲后，完整显示 `A Moment Apart (Live) (ODESZA VIP Remix) / ODESZA`、6:23；执行网易云最小化后进度与录音继续增长，未开启窗口识别。
+- 更新临时签名后首次录音启动超时；通过系统设置更新共鸣原有 AudioCapture 授权并重开应用后恢复。本轮未重启 coreaudiod，未改原有歌单。
+- 系统驱动切歌与暂停分别保存 50.517333 秒长标题段与 35.008 秒 `With an Orchid`；均为 48 kHz 双声道 Float32、零丢帧，分别为 2,424,832 / 1,680,384 帧，有限非零 PCM。完整标题、艺人、来源应用、Bundle ID、实际采集 PID、metadataSource=systemPlayer、媒体起点均随记录保存；未写虚假的网易云 ID。
+- 35.008 秒段频谱已成功写入。50.517333 秒段首次分析失败已定位：2,424,832 帧恰好等于 37 × 65,536，解码循环在读完最后一个完整块后额外调用 AVAudioFile.read，触发 Foundation._GenericObjCError。独立分块探针确认前 37 块均有效，错误发生于额外的 EOF 读取；未进入频谱压缩或写入。修复为按剩余帧数读取后，同一真实 CAF 成功生成 1,181 个频谱帧和约 133 MB 的压缩特征文件。
+- 修复后的独立生产解码 probe 通过 131,072 帧整数块和 131,195 帧非整数块 CAF；`verify-core.sh` 全部检查通过，覆盖完整时间线、双声道、PSD 与 C/D/Dhigh。新增 XCTest 用例已保存，但本机缺少 XCTest 模块，`swift test` 未运行成功；没有将独立 probe 冒充 XCTest 通过。
+- 失败的 50.5 秒段使用修复后的生产分析与存储代码重新生成特征，并恢复同一资料库记录；原音频、歌名、来源、PID 和录音起点不变。最终签名应用再次完成系统识别、自动录音、暂停保存与分析：`With an Orchid` 27.136 秒、48 kHz 双声道、1,302,528 帧、零丢帧。最终退出测试播放，保留自动积累开启。
+- 私有服务依赖实际运行的 macOS 版本；本机验证为 macOS 26.6.2，没有在 macOS 14.2 真机重新验证 AX/OCR。播放器轮询依然不证明精确整曲边界，录音保留为片段。本机原始证据见忽略目录 `test-output/verification/live-recording-0.2.6.json`。35 秒段正式 UI 匹配拉斐尔得到 D 3.1 dB、Dhigh 2.9 dB；只代表该片段和平直参考。
 
 ## 0.2.5 图标与最终真机验证
 

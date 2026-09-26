@@ -59,6 +59,11 @@ struct TrackEntry: Codable, Identifiable, Hashable {
     var contentSHA256: String?
     var droppedFrames: UInt64?
     var sourceProcessID: Int32?
+    // Optional so records written before native player metadata was added
+    // continue to decode without inventing a source application.
+    var sourceBundleIdentifier: String?
+    var sourceApplicationName: String?
+    var metadataSource: String?
     var analyzed: Bool { featurePath != nil }
     var coverageLabel: String { audioPath == nil ? "仅歌曲信息" : (isFull ? "完整文件" : "已采 \(durationLabel(capturedSeconds))") }
 }

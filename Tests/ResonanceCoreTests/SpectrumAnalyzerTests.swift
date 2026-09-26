@@ -56,6 +56,57 @@ final class SpectrumAnalyzerTests: XCTestCase {
         XCTAssertEqual(features.coverage.kind, .complete)
     }
 
+    func testDecodesCAFAtExactAndNonExactReadChunkBoundaries() throws {
+        let sampleRate = 48_000.0
+        let analyzer = SpectrumAnalyzer(configuration: .init(frameDurationSeconds: 0.18))
+
+        for frameCount in [65_536 * 2, 65_536 * 2 + 123] {
+            let url = try writeCAF(frameCount: frameCount, sampleRate: sampleRate)
+            defer { try? FileManager.default.removeItem(at: url) }
+
+            let coverage = try Coverage(
+                kind: .complete,
+                intervals: [TimeRange(startSeconds: 0, endSeconds: Double(frameCount) / sampleRate)],
+                identityConfirmed: true
+            )
+            let features = try analyzer.analyze(fileURL: url, coverage: coverage)
+
+            XCTAssertEqual(features.sampleRate, sampleRate, accuracy: 1e-9)
+            XCTAssertEqual(features.channelCount, 2)
+            XCTAssertEqual(features.durationSeconds, Double(frameCount) / sampleRate, accuracy: 1e-9)
+            XCTAssertFalse(features.frames.isEmpty)
+        }
+    }
+
+    private func writeCAF(frameCount: Int, sampleRate: Double) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("resonance-boundary-" + UUID().uuidString + ".caf")
+        let format = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 2,
+            interleaved: true
+        ))
+        let file = try AVAudioFile(
+            forWriting: url,
+            settings: format.settings,
+            commonFormat: format.commonFormat,
+            interleaved: format.isInterleaved
+        )
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(frameCount)
+        ))
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        let samples = try XCTUnwrap(buffer.floatChannelData?.pointee)
+        for frame in 0..<frameCount {
+            samples[frame * 2] = Float(sin(2 * Double.pi * 440 * Double(frame) / sampleRate))
+            samples[frame * 2 + 1] = Float(sin(2 * Double.pi * 2_000 * Double(frame) / sampleRate))
+        }
+        try file.write(from: buffer)
+        return url
+    }
+
     private func peakFrequency(_ psd: [Double], bins: [Double]) -> Double {
         guard let index = psd.indices.max(by: { psd[$0] < psd[$1] }) else { return .nan }
         return bins[index]
