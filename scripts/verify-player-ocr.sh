@@ -7,6 +7,7 @@ trap 'rm -rf "$probe_dir"' EXIT
 
 cp "$repo_root/Sources/ResonanceApp/PlayerObserver.swift" "$probe_dir/PlayerObserver.swift"
 sed -i '' 's/private func cropBottomBar/func cropBottomBar/' "$probe_dir/PlayerObserver.swift"
+sed -i '' 's/private func suppressRedBadgePixels/func suppressRedBadgePixels/' "$probe_dir/PlayerObserver.swift"
 sed -i '' 's/private func publishStableOCR/func publishStableOCR/' "$probe_dir/PlayerObserver.swift"
 sed -i '' 's/private func publishSnapshot/func publishSnapshot/' "$probe_dir/PlayerObserver.swift"
 swiftc -parse-as-library \

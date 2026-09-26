@@ -92,7 +92,7 @@ struct MainView: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: "waveform.path").font(.system(size: 27, weight: .light)).foregroundStyle(Palette.accent)
+                brandIcon
                 VStack(alignment: .leading, spacing: 1) { Text("共鸣").font(.system(size: 22, weight: .semibold)); Text("RESONANCE").font(.system(size: 9, design: .monospaced)).tracking(2.5).foregroundStyle(Palette.muted) }
             }.padding(.bottom, 46)
             Text("聆听方式").font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.muted).padding(.bottom, 13)
@@ -128,6 +128,29 @@ struct MainView: View {
             Text("频响 × 真实音频").font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.65))
             Text("所有声学计算在本机完成").font(.system(size: 10)).foregroundStyle(Palette.muted).padding(.top, 5)
         }.padding(.horizontal, 20).padding(.top, 42).padding(.bottom, 25).frame(width: 220).background(.black.opacity(0.14))
+    }
+
+    @ViewBuilder
+    private var brandIcon: some View {
+        if let iconPath = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+           let icon = NSImage(contentsOfFile: iconPath) {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: 32, height: 32)
+        } else if let iconPath = Bundle.main.path(forResource: "AppIcon", ofType: "png"),
+                  let icon = NSImage(contentsOfFile: iconPath) {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: 32, height: 32)
+        } else {
+            Image(systemName: "waveform.path")
+                .font(.system(size: 27, weight: .light))
+                .foregroundStyle(Palette.accent)
+        }
     }
 
     private var workspace: some View {

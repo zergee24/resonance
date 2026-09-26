@@ -31,9 +31,58 @@ struct OCRProbe {
         }
         try require(smallCrop.width == small.width && smallCrop.height == small.height, "small image crop exceeded image bounds")
 
+        try verifyRedBadgeMask(observer)
         try verifyOCRStability()
         print("PASS production OCR crop probe: normal=\(cropped.width)x\(cropped.height), small=\(smallCrop.width)x\(smallCrop.height), bottom pixels only")
+        print("PASS red VIP badge probe: compact red badge masked, white VIP title pixels retained")
         print("PASS OCR boundaries: single-frame noise ignored, repeated change accepted, pause immediate, stale identity expires")
+    }
+
+    @MainActor
+    private static func verifyRedBadgeMask(_ observer: PlayerObserver) throws {
+        let image = try makeRedBadgeImage(width: 400, height: 80)
+        guard let masked = observer.suppressRedBadgePixels(from: image) else {
+            throw ProbeFailure("production red badge mask returned nil for a valid image")
+        }
+
+        let sourcePixels = try rgbaPixels(image)
+        let maskedPixels = try rgbaPixels(masked)
+        let sourceRed = sourcePixels.filter { pixel in
+            let red = Int(pixel.red)
+            return red >= 150 && red > Int(pixel.green) + 55 && red > Int(pixel.blue) + 55
+        }.count
+        let maskedRed = maskedPixels.filter { pixel in
+            let red = Int(pixel.red)
+            return red >= 150 && red > Int(pixel.green) + 55 && red > Int(pixel.blue) + 55
+        }.count
+        try require(sourceRed > 0, "red badge fixture has no saturated-red pixels")
+        try require(maskedRed == 0, "saturated-red badge pixels remained in OCR input")
+
+        // The white block in the metadata region represents a legitimate song
+        // title containing the word VIP. It must survive the image mask.
+        let retainedWhite = maskedPixels.enumerated().filter { index, pixel in
+            let x = index % image.width
+            let y = index / image.width
+            return x >= 145 && x < 175 && y >= 8 && y < 20 && pixel.red >= 220 && pixel.green >= 220 && pixel.blue >= 220
+        }.count
+        try require(retainedWhite > 0, "white VIP title pixels were removed with the badge")
+        let changedWhite = maskedPixels.enumerated().filter { index, pixel in
+            let x = index % image.width
+            let y = index / image.width
+            guard x >= 145 && x < 175 && y >= 8 && y < 20 else { return false }
+            let source = sourcePixels[index]
+            return pixel.red != source.red || pixel.green != source.green || pixel.blue != source.blue || pixel.alpha != source.alpha
+        }.count
+        try require(changedWhite == 0, "white VIP title pixels changed during red badge preprocessing")
+
+        let sourceTop = sourcePixels[5 * image.width + 10]
+        let sourceBottom = sourcePixels[image.width * (image.height - 6) + 10]
+        let maskedTop = maskedPixels[5 * image.width + 10]
+        let maskedBottom = maskedPixels[image.width * (image.height - 6) + 10]
+        try require(maskedTop.red == sourceTop.red && maskedTop.green == sourceTop.green && maskedTop.blue == sourceTop.blue,
+                    "red badge preprocessing flipped the image's vertical direction")
+        try require(maskedBottom.red == sourceBottom.red && maskedBottom.green == sourceBottom.green && maskedBottom.blue == sourceBottom.blue,
+                    "red badge preprocessing changed the lower playback bar direction")
     }
 
     @MainActor
@@ -114,6 +163,66 @@ struct OCRProbe {
             throw ProbeFailure("could not create split-color CGImage")
         }
         return image
+    }
+
+    private static func makeRedBadgeImage(width: Int, height: Int) throws -> CGImage {
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for row in 0..<height {
+            for column in 0..<width {
+                let isBadgeBorder = (column == 100 || column == 129) && row >= 30 && row < 50 ||
+                    (row == 30 || row == 49) && column >= 100 && column < 130
+                let isBadgeText = (column >= 107 && column < 111 || column >= 115 && column < 119 || column >= 123 && column < 127) &&
+                    row >= 35 && row < 45
+                let isWhiteTitle = column >= 145 && column < 175 && row >= 8 && row < 20
+                let background: (UInt8, UInt8, UInt8) = row < height / 2 ? (28, 28, 32) : (60, 60, 68)
+                let color: (UInt8, UInt8, UInt8) = isWhiteTitle
+                    ? (245, 245, 245)
+                    : isBadgeBorder || isBadgeText ? (220, 40, 50) : background
+                let offset = (row * width + column) * 4
+                bytes[offset] = color.0
+                bytes[offset + 1] = color.1
+                bytes[offset + 2] = color.2
+                bytes[offset + 3] = 255
+            }
+        }
+        let data = Data(bytes)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw ProbeFailure("could not create red badge CGImage")
+        }
+        return image
+    }
+
+    private struct RGBA {
+        let red: UInt8
+        let green: UInt8
+        let blue: UInt8
+        let alpha: UInt8
+    }
+
+    private static func rgbaPixels(_ image: CGImage) throws -> [RGBA] {
+        guard let data = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data) else {
+            throw ProbeFailure("image has no readable pixel data")
+        }
+        let count = CFDataGetLength(data) / 4
+        return (0..<count).map { index in
+            let offset = index * 4
+            return RGBA(red: bytes[offset], green: bytes[offset + 1], blue: bytes[offset + 2], alpha: bytes[offset + 3])
+        }
     }
 
     private static func pixelColors(_ image: CGImage) throws -> [PixelColor] {

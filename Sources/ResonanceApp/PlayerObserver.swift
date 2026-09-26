@@ -886,6 +886,11 @@ public final class PlayerObserver: ObservableObject {
     }
 
     private func recognizeBottomBar(_ image: CGImage, scale: CGFloat = 1) -> OCRMetadata {
+        // NetEase renders the red VIP badge beside the white song title. Vision
+        // sometimes joins that badge into the title line (for example
+        // "Trouble I'm In VIP"). Remove only saturated-red metadata pixels
+        // before OCR; the title and artist pixels remain untouched.
+        let ocrImage = suppressRedBadgePixels(from: image, scale: scale) ?? image
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
@@ -894,7 +899,7 @@ public final class PlayerObserver: ObservableObject {
 
         let observations: [VNRecognizedTextObservation]
         do {
-            let handler = VNImageRequestHandler(cgImage: image, options: [:])
+            let handler = VNImageRequestHandler(cgImage: ocrImage, options: [:])
             try handler.perform([request])
             observations = request.results ?? []
         } catch {
@@ -945,6 +950,68 @@ public final class PlayerObserver: ObservableObject {
             duration: duration,
             playbackState: playbackState,
             hasEvidence: hasEvidence
+        )
+    }
+
+    /// Removes saturated-red pixels from the left metadata area. This is
+    /// intentionally image evidence based: deleting a string such as "VIP"
+    /// would corrupt real song titles containing that word.
+    private func suppressRedBadgePixels(from image: CGImage, scale: CGFloat = 1) -> CGImage? {
+        guard image.width > 0, image.height > 0 else { return nil }
+
+        let width = image.width
+        let height = image.height
+        let bytesPerRow = width * 4
+        var bytes = [UInt8](repeating: 0, count: height * bytesPerRow)
+        guard let context = CGContext(
+            data: &bytes,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+
+        context.interpolationQuality = .none
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let effectiveScale = max(scale, 1)
+        let metadataStart = min(width, max(0, Int((80 * effectiveScale).rounded())))
+        let metadataEnd = min(width, max(metadataStart, Int((CGFloat(width) * 0.45).rounded())))
+        guard metadataStart < metadataEnd else { return image }
+        for y in 0..<height {
+            for x in metadataStart..<metadataEnd {
+                let offset = (y * width + x) * 4
+                let red = Int(bytes[offset])
+                let green = Int(bytes[offset + 1])
+                let blue = Int(bytes[offset + 2])
+                guard bytes[offset + 3] > 0,
+                      red >= 150,
+                      red >= green + 55,
+                      red >= blue + 55 else { continue }
+                // Transparent black is ignored by Vision and does not touch
+                // adjacent white/gray title pixels.
+                bytes[offset] = 0
+                bytes[offset + 1] = 0
+                bytes[offset + 2] = 0
+                bytes[offset + 3] = 0
+            }
+        }
+
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
         )
     }
 
