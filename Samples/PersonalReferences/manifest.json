@@ -1,0 +1,28 @@
+[
+  {
+    "name": "Sennheiser HE1",
+    "resource": "Sennheiser_HE1_HuiHiFi.csv",
+    "source": "https://huihifi.com/evaluation/16a081dd-0c20-4ef2-9918-f2f9fa5554d2",
+    "formFactor": "over-ear",
+    "pointCount": 957,
+    "minimumHz": 20,
+    "maximumHz": 19896.97461,
+    "sha256": "c0cf6879dda2a0ae42bdee0e33fb94b4046d4e62d9389a9daeac31a68a2e973a",
+    "retrieved": "2026-09-26",
+    "extraction": "Resonance 0.2.6 built-in WKWebView, public rendered frequency-response chart via curve_extractor.js",
+    "measurementSystem": "Product page does not identify exact fixture, compensation or channel; site white paper says mainly GRAS 5010 ear model."
+  },
+  {
+    "name": "MA Audio ALTER EGO（无点档位）",
+    "resource": "MA_Audio_Alter_Ego_No_Dot_HuiHiFi.csv",
+    "source": "https://huihifi.com/evaluation/ea9f19d1-89bb-4cc8-8267-5bb92f6a6b63",
+    "formFactor": "in-ear",
+    "pointCount": 957,
+    "minimumHz": 20,
+    "maximumHz": 19896.97461,
+    "sha256": "d79f238017fae0df980d1fc952d0499de46a173e7d3900e70bd1a441a736bfbc",
+    "retrieved": "2026-09-26",
+    "extraction": "Resonance 0.2.6 built-in WKWebView, public rendered frequency-response chart via curve_extractor.js",
+    "measurementSystem": "Product page does not identify exact fixture, compensation or channel; site white paper says mainly GRAS 5010 ear model."
+  }
+]

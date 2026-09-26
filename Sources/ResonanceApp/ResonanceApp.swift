@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ResonanceCore
 
 @main
 struct ResonanceApplication: App {
@@ -81,7 +82,7 @@ struct MainView: View {
         .onChange(of: model.selectedTrackID) { _, _ in model.recompute() }
         .onChange(of: model.selectedHeadphoneID) { _, _ in model.recompute() }
         .onChange(of: model.selectedPlaylistID) { _, _ in model.recompute() }
-        .onChange(of: model.sort) { _, _ in model.recompute() }
+        .onChange(of: model.sort) { _, _ in model.resortResults() }
         .onChange(of: model.includePartial) { _, _ in model.recompute() }
         .onChange(of: model.isFollowPlaying) { _, enabled in
             if enabled { model.syncFollowedPlayback() }
@@ -232,8 +233,20 @@ struct MainView: View {
                 }
                 Button("导入网易云歌单") { model.openWebsite("https://music.163.com/#/my/m/music/playlist") }
             }
+            if model.preferredReferences.isEmpty {
+                Text("尚未选择个人偏好参考；可在声学资料库勾选“我喜欢的声音”。")
+                    .font(.caption2).foregroundStyle(Palette.muted)
+            } else {
+                Text("个人参考：\(model.preferredReferences.map { $0.name }.joined(separator: "、")) · 偏好接近度按整体 dB，低值更接近。")
+                    .font(.caption2).foregroundStyle(Palette.muted)
+            }
             HStack {
-                Picker("排序", selection: $model.sort) { ForEach(SongSort.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).frame(maxWidth: 380)
+                HStack(spacing: 6) {
+                    Text("排序").font(.system(size: 11)).foregroundStyle(Palette.muted)
+                    Picker("排序", selection: $model.sort) {
+                        ForEach(SongSort.allCases) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.menu).labelsHidden().frame(minWidth: 128, alignment: .leading)
+                }
                 Spacer()
                 Toggle("包含采集片段", isOn: $model.includePartial).toggleStyle(.checkbox).font(.system(size: 11))
                 Button("生成网易云歌单…") { showPlaylistExport = true }
@@ -246,6 +259,10 @@ struct MainView: View {
     private var resultsPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionCaption(title: model.mode == .song ? "耳机与这首歌" : "候选歌曲", trailing: "\(model.results.count) RESULTS")
+            if model.mode == .headphone && model.sort == .character {
+                Text("C 只表示谱形变化更明显，不代表更好听；偏好接近度请看低 dB。")
+                    .font(.caption2).foregroundStyle(Palette.muted)
+            }
             if Set(model.results.filter(\.eligible).map(\.comparisonGroup)).count > 1 {
                 Text("结果按参考和实际频段分组。").font(.caption).foregroundStyle(.orange)
             }
@@ -260,8 +277,11 @@ struct MainView: View {
                         VStack(alignment: .leading, spacing: 9) {
                             HStack { Text(result.name).font(.system(size: 13, weight: .medium)).lineLimit(1); Spacer(); Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(Palette.muted) }
                             Text(result.subtitle).font(.system(size: 10)).foregroundStyle(Palette.muted).lineLimit(2)
+                            if let personal = result.personalMatch {
+                                personalSummary(personal, bestReferenceName: result.bestReferenceName)
+                            }
                             if result.eligible {
-                                HStack { metric("D", result.d); metric("高频偏差", result.high); if model.mode == .headphone && model.sort == .character { metric("变化", result.c, digits: 3) } }
+                                HStack { metric("D", result.d); metric("高频偏差", result.high); if model.mode == .headphone && model.sort == .character { metric("C 谱形变化", result.c, digits: 3) } }
                             } else { Text(result.reason).font(.system(size: 10)).foregroundStyle(.orange.opacity(0.9)).lineLimit(3) }
                         }.padding(15).frame(maxWidth: .infinity, alignment: .leading)
                             .background(model.selectedResult?.id == result.id ? Palette.accent.opacity(0.08) : Palette.panel, in: RoundedRectangle(cornerRadius: 9))
@@ -276,6 +296,27 @@ struct MainView: View {
         HStack(spacing: 4) { Text(label).foregroundStyle(Palette.muted); Text(value.map { String(format: "%.*f", digits, $0) } ?? "—").foregroundStyle(.white) }.font(.system(size: 10, design: .monospaced)).padding(.trailing, 6)
     }
 
+    private func personalSummary(_ personal: PersonalMatchResult, bestReferenceName: String?) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                Text("偏好接近度").foregroundStyle(Palette.muted)
+                Text("低 dB 更接近").foregroundStyle(Palette.muted.opacity(0.8))
+                Spacer()
+                if let name = bestReferenceName ?? personal.matches.first(where: { $0.referenceID == personal.bestReferenceID })?.referenceName {
+                    Text("最佳：\(name)").foregroundStyle(Palette.accent).lineLimit(1)
+                }
+            }
+            ForEach(personal.matches.prefix(2)) { match in
+                HStack(spacing: 5) {
+                    Text(match.referenceName).lineLimit(1)
+                    Spacer()
+                    Text(match.overallDeviationDB.map { String(format: "%.1f dB", $0) } ?? "—")
+                        .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white)
+                }
+            }
+        }.font(.system(size: 10))
+    }
+
     private var detailPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             SectionCaption(title: "这首歌的频段表现", trailing: "频响 × 歌曲能量")
@@ -286,6 +327,9 @@ struct MainView: View {
                 }
             }
             if let result = model.selectedResult {
+                if let personal = result.personalMatch {
+                    personalDetail(personal, bestReferenceID: result.bestReferenceID)
+                }
                 if let d = result.d {
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(String(format: "%.1f dB", d)).font(.system(size: 32, weight: .medium, design: .rounded))
@@ -299,6 +343,69 @@ struct MainView: View {
                 EmptyPanel(icon: "chart.xyaxis.line", title: "选一首歌，看看哪里突出", detail: "这里会显示歌曲的能量分布，以及耳机相对参考的变化。")
             }
         }.padding(18).background(Palette.panel, in: RoundedRectangle(cornerRadius: 11))
+    }
+
+    private func personalDetail(_ personal: PersonalMatchResult, bestReferenceID: UUID?) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("偏好参考 · \(personal.matches.count) 条独立结果").font(.system(size: 11, weight: .semibold))
+                Spacer()
+                if let low = personal.commonMinimumHz, let high = personal.commonMaximumHz {
+                    Text("共同 \(frequencyLabel(low))–\(frequencyLabel(high)) Hz")
+                        .font(.system(size: 9, design: .monospaced)).foregroundStyle(Palette.muted)
+                }
+            }
+            Text("低 dB 表示更接近该参考；P90 按压缩帧能量加权。最大差异位置是录音内时间，不等于最易听见的差异。")
+                .font(.caption2).foregroundStyle(Palette.muted)
+            ForEach(personal.matches) { match in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(match.referenceName).font(.system(size: 11, weight: .medium))
+                        if match.referenceID == bestReferenceID { TinyBadge(text: "最佳参考", color: Palette.accent) }
+                        Spacer()
+                        Text(personalStatusLabel(match.status)).font(.caption2).foregroundStyle(match.status == .evaluated ? Palette.accent : .orange)
+                    }
+                    HStack(spacing: 12) {
+                        personalMetric("整体", match.overallDeviationDB)
+                        personalMetric("10–20k", match.highFrequencyDeviationDB)
+                        personalMetric("P90", match.frameErrorP90DB)
+                    }
+                    if let time = match.worstFrameStartTimeSeconds {
+                        Text("录音内差异最大位置约 \(durationLabel(time))\(match.worstFrameErrorDB.map { " · \(String(format: "%.1f dB", $0))" } ?? "")")
+                            .font(.caption2).foregroundStyle(Palette.muted)
+                    }
+                    if let upper = match.evaluatedMaxHz, upper < 20_000 {
+                        Text("10–20 kHz 实际上限 \(frequencyLabel(upper)) Hz；未向上外推")
+                            .font(.caption2).foregroundStyle(.orange.opacity(0.85))
+                    }
+                    let extended = match.frequencyEvidence.filter(\.isExtendedFrequency)
+                    if !extended.isEmpty {
+                        Text("扩展频段：\(extended.map { "\(frequencyLabel($0.lowerHz))–\(frequencyLabel($0.upperHz)) Hz" }.joined(separator: "、"))")
+                            .font(.caption2).foregroundStyle(.orange.opacity(0.8))
+                    }
+                    if !match.limitations.isEmpty {
+                        Text(match.limitations.joined(separator: "；")).font(.caption2).foregroundStyle(Palette.muted).lineLimit(2)
+                    }
+                }.padding(10).background(Palette.base.opacity(0.55), in: RoundedRectangle(cornerRadius: 7))
+            }
+        }
+    }
+
+    private func personalMetric(_ label: String, _ value: Double?) -> some View {
+        HStack(spacing: 4) {
+            Text(label).foregroundStyle(Palette.muted)
+            Text(value.map { String(format: "%.1f dB", $0) } ?? "—")
+                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white)
+        }.font(.system(size: 9))
+    }
+
+    private func personalStatusLabel(_ status: PersonalReferenceMatch.Status) -> String {
+        switch status {
+        case .evaluated: return "已计算"
+        case .partial: return "部分覆盖"
+        case .noAudioContent: return "无歌曲能量"
+        case .unavailable: return "不可用"
+        }
     }
 
     private func bandTable(_ bands: [BandPresentation]) -> some View {

@@ -15,7 +15,7 @@ final class AppModel: ObservableObject {
     @Published var selectedTrackID: UUID?
     @Published var selectedHeadphoneID: UUID?
     @Published var selectedPlaylistID: UUID?
-    @Published var sort: SongSort = .balanced
+    @Published var sort: SongSort = .personal
     @Published var includePartial = true
     @Published var results: [MatchPresentation] = []
     @Published var selectedResultID: String?
@@ -68,6 +68,14 @@ final class AppModel: ObservableObject {
             headphones = try db.load(HeadphoneEntry.self, kind: "headphones")
             tracks = try db.load(TrackEntry.self, kind: "tracks")
             playlists = try db.load(PlaylistEntry.self, kind: "playlists")
+            do {
+                try loadPersonalReferenceSamples()
+            } catch {
+                // Sample references are additive convenience data. A missing
+                // resource must not make an otherwise readable user library
+                // unavailable.
+                report(error)
+            }
             selectedTrackID = tracks.first?.id
             selectedHeadphoneID = headphones.first?.id
             Task { recompute() }
@@ -82,6 +90,7 @@ final class AppModel: ObservableObject {
     var selectedHeadphone: HeadphoneEntry? { headphones.first { $0.id == selectedHeadphoneID } }
     var selectedResult: MatchPresentation? { results.first { $0.id == selectedResultID } ?? results.first }
     var references: [LibraryCurve] { curves.filter(\.isReference) }
+    var preferredReferences: [LibraryCurve] { references.filter { $0.isPreferred == true } }
     var analyzedCount: Int { tracks.filter(\.analyzed).count }
 
     func report(_ error: Error) { errorMessage = error.localizedDescription; status = error.localizedDescription }
@@ -92,6 +101,18 @@ final class AppModel: ObservableObject {
             try database.save(item, kind: "headphones", id: item.id.uuidString)
             if let index = headphones.firstIndex(where: { $0.id == item.id }) { headphones[index] = item }
             else { headphones.append(item) }
+            recompute()
+        } catch { report(error) }
+    }
+
+    func setReferencePreferred(_ referenceID: UUID, preferred: Bool) {
+        guard let index = curves.firstIndex(where: { $0.id == referenceID }), curves[index].isReference else { return }
+        guard let database else { return }
+        var changed = curves[index]
+        changed.isPreferred = preferred
+        do {
+            try database.save(changed, kind: "curves", id: changed.id.uuidString)
+            curves[index] = changed
             recompute()
         } catch { report(error) }
     }

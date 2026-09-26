@@ -1,4 +1,5 @@
 import Foundation
+import ResonanceCore
 
 enum WorkMode: String, CaseIterable, Identifiable {
     case song = "根据歌曲找耳机"
@@ -20,6 +21,9 @@ struct LibraryCurve: Codable, Identifiable, Hashable {
     var validMax: Double
     var isReference: Bool
     var notes: String
+    /// Nil keeps curves written before the personal-reference feature
+    /// compatible; only an explicit true participates in personal matching.
+    var isPreferred: Bool? = nil
     var importedAt = Date()
 }
 
@@ -94,7 +98,14 @@ struct MatchPresentation: Identifiable {
     var evaluatedMax: Double?
     var comparisonGroup = ""
     var comparisonLabel = ""
+    var personalMatch: PersonalMatchResult? = nil
+    var bestReferenceID: UUID? = nil
+    var bestReferenceName: String? = nil
     var eligible: Bool { d != nil }
+    var personalScore: Double? {
+        guard let personalMatch, let bestReferenceID else { return nil }
+        return personalMatch.matches.first(where: { $0.referenceID == bestReferenceID })?.overallDeviationDB
+    }
 }
 
 struct BandPresentation: Identifiable {
@@ -111,6 +122,7 @@ struct BandPresentation: Identifiable {
 }
 
 enum SongSort: String, CaseIterable, Identifiable {
+    case personal = "偏好接近度"
     case character = "谱形变化"
     case balanced = "参考偏差 D"
     case high = "10–20k 偏差"

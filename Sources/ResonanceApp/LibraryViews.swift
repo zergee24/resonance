@@ -47,7 +47,28 @@ struct LibraryScreen: View {
                 }
                 SectionCaption(title: "参考曲线", trailing: "\(model.references.count) REFERENCES")
                 ForEach(model.references) { reference in
-                    HStack { Image(systemName: "scope").foregroundStyle(.orange); Text(reference.name); Spacer(); Text(reference.measurementSystem.isEmpty ? "体系未确认" : reference.measurementSystem).foregroundStyle(Palette.muted) }.font(.callout).padding(14).background(Palette.panel, in: RoundedRectangle(cornerRadius: 8))
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: reference.isPreferred == true ? "heart.fill" : "scope")
+                            .foregroundStyle(reference.isPreferred == true ? Palette.accent : .orange)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 8) {
+                                Text(reference.name).font(.callout.weight(.medium))
+                                if reference.isPreferred == true { TinyBadge(text: "偏好参考", color: Palette.accent) }
+                            }
+                            HStack(spacing: 8) {
+                                TinyBadge(text: "\(frequencyLabel(reference.validMin))–\(frequencyLabel(reference.validMax)) Hz")
+                                TinyBadge(text: reference.measurementSystem.isEmpty ? "体系未确认" : reference.measurementSystem, color: reference.measurementSystem.isEmpty ? .orange : Palette.muted)
+                            }
+                            Text(referenceSourceLabel(reference.source)).font(.caption2).foregroundStyle(Palette.muted).lineLimit(1).truncationMode(.middle)
+                            if !reference.notes.isEmpty { Text(reference.notes).font(.caption2).foregroundStyle(Palette.muted).lineLimit(2) }
+                        }
+                        Spacer(minLength: 12)
+                        Toggle("我喜欢的声音", isOn: Binding(
+                            get: { reference.isPreferred == true },
+                            set: { model.setReferencePreferred(reference.id, preferred: $0) }
+                        )).toggleStyle(.checkbox).font(.caption)
+                    }.padding(14).background(Palette.panel, in: RoundedRectangle(cornerRadius: 8))
                 }
                 if model.references.isEmpty { Text("导入你想比较的参考曲线。拉斐尔示例附带平直计算基线，可随时更换。").font(.callout).foregroundStyle(Palette.muted) }
                 SectionCaption(title: "录音与来源", trailing: "\(model.tracks.count) ITEMS")
@@ -55,6 +76,13 @@ struct LibraryScreen: View {
             }.padding(30)
         }
     }
+}
+
+private func referenceSourceLabel(_ value: String) -> String {
+    guard let url = URL(string: value), let host = url.host, !host.isEmpty else {
+        return value.isEmpty ? "来源未填写" : value
+    }
+    return host + (url.path.isEmpty ? "" : url.path)
 }
 
 struct TrackLibraryRow: View {
@@ -150,7 +178,15 @@ struct CurveImportSheet: View {
                 }.buttonStyle(.borderedProminent)
             }
         }.padding(28).frame(width: 650)
-            .onAppear { name = draft.name; notes = draft.notes; minimum = String(format: "%g", draft.frequencies.min() ?? 20); maximum = String(format: "%g", draft.frequencies.max() ?? 20_000) }
+            .onAppear {
+                name = draft.name
+                notes = draft.notes
+                // Keep a lossless Double round-trip. Formatting with %g can
+                // round an imported upper bound such as 19896.964… to 19897,
+                // which then falls outside the actual curve's valid range.
+                minimum = String(draft.frequencies.min() ?? 20)
+                maximum = String(draft.frequencies.max() ?? 20_000)
+            }
     }
 }
 
