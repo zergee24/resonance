@@ -57,6 +57,9 @@ final class AppModel: ObservableObject {
     var matchTask: Task<Void, Never>?
     var analysisTask: Task<Void, Never>?
     var analysisRevision: UUID?
+    /// Deduplicate pending/running segment revisions; completed requests
+    /// release their key so failed analysis can be retried.
+    var queuedAnalysisKeys = Set<String>()
     var disposables = Set<AnyCancellable>()
 
     init(preferences: UserDefaults = .standard) {
@@ -77,9 +80,12 @@ final class AppModel: ObservableObject {
                 // unavailable.
                 report(error)
             }
+            let restoredPendingAnalyses = restorePendingAnalyses()
             selectedTrackID = tracks.first?.id
             selectedHeadphoneID = headphones.first?.id
-            Task { recompute() }
+            if !restoredPendingAnalyses {
+                Task { recompute() }
+            }
         } catch {
             database = nil
             errorMessage = error.localizedDescription
@@ -149,50 +155,29 @@ final class AppModel: ObservableObject {
 
     func analyzeFiles(_ urls: [URL]) {
         guard !busy, let database else { return }
-        let previousAnalysis = analysisTask
-        let revision = UUID()
-        analysisRevision = revision
-        busy = true
-        analysisTask = Task {
-            await previousAnalysis?.value
-            defer { if analysisRevision == revision { busy = false } }
-            for sourceURL in urls {
-                if Task.isCancelled { break }
-                var track = TrackEntry(title: sourceURL.deletingPathExtension().lastPathComponent, artist: "", processingState: "本地音频文件")
-                let destination = database.directory.appendingPathComponent("Audio/\(track.id.uuidString).\(sourceURL.pathExtension)")
-                do {
-                    status = "正在分析 · \(track.title)"
-                    try FileManager.default.copyItem(at: sourceURL, to: destination)
-                    track.audioPath = destination.path
-                    let input = try AVAudioFile(forReading: destination)
-                    let duration = Double(input.length) / input.processingFormat.sampleRate
-                    let coverage = try Coverage(kind: .complete, mediaDurationSeconds: duration, intervals: [TimeRange(startSeconds: 0, endSeconds: duration)], identityConfirmed: true)
-                    let id = track.id
-                    let analyzed = try await Task.detached(priority: .userInitiated) {
-                        (try SpectrumAnalyzer().analyze(fileURL: destination, coverage: coverage, recordingID: id), try LocalStore.audioDigest(destination))
-                    }.value
-                    let feature = analyzed.0
-                    track.contentSHA256 = analyzed.1
-                    let artifactURL = database.featureURL(id: id)
-                    try await Task.detached(priority: .utility) { try LocalStore.writeArtifact(feature, to: artifactURL) }.value
-                    track.featurePath = artifactURL.path
-                    track.duration = feature.durationSeconds
-                    track.capturedSeconds = feature.durationSeconds
-                    track.sampleRate = feature.sampleRate
-                    track.channels = feature.channelCount
-                    track.isFull = true
-                    try saveTrack(track)
-                    selectedTrackID = track.id
-                    status = "已分析 \(track.title) · \(Int(feature.sampleRate)) Hz · \(feature.channelCount) 声道"
-                } catch {
-                    track.error = error.localizedDescription
-                    let analysisError = error
-                    do { try saveTrack(track) }
-                    catch { report(error); continue }
-                    report(analysisError)
-                }
+        for sourceURL in urls {
+            var track = TrackEntry(title: sourceURL.deletingPathExtension().lastPathComponent, artist: "", processingState: "音频已保存，等待分析")
+            let destination = database.directory.appendingPathComponent("Audio/\(track.id.uuidString).\(sourceURL.pathExtension)")
+            do {
+                status = "正在准备分析 · \(track.title)"
+                try FileManager.default.copyItem(at: sourceURL, to: destination)
+                track.audioPath = destination.path
+                let input = try AVAudioFile(forReading: destination)
+                let duration = Double(input.length) / input.processingFormat.sampleRate
+                track.duration = duration
+                track.capturedSeconds = duration
+                track.sampleRate = input.processingFormat.sampleRate
+                track.channels = Int(input.processingFormat.channelCount)
+                track.isFull = true
+                let coverage = try Coverage(kind: .complete, mediaDurationSeconds: duration, recordedDurationSeconds: duration, intervals: [TimeRange(startSeconds: 0, endSeconds: duration)], identityConfirmed: true)
+                try saveTrack(track)
+                enqueueAnalysis(track: track, coverage: coverage, automatic: false, selectOnCompletion: true)
+            } catch {
+                track.error = error.localizedDescription
+                do { try saveTrack(track) }
+                catch { report(error); continue }
+                report(error)
             }
-            recompute()
         }
     }
 

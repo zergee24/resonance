@@ -38,7 +38,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         model.prepareToQuit()
         Task { @MainActor in
             await model.captureStartTask?.value
-            await model.analysisTask?.value
+            // Captures are already stopped and their TrackEntry rows are
+            // persisted by prepareToQuit(). Pending spectrum work is
+            // intentionally left behind; each row has audioPath without a
+            // featurePath and will be resumed on the next launch. Waiting
+            // here can keep termination blocked for hours on long recordings.
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

@@ -357,6 +357,86 @@ public struct SpectrumFrame: Codable, Sendable, Equatable {
         self.sampleCount = sampleCount
         self.powerSpectralDensityByChannel = powerSpectralDensityByChannel
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case startTimeSeconds
+        case sampleCount
+        /// Legacy representation retained so existing feature artifacts remain readable.
+        case powerSpectralDensityByChannel
+        /// Each Data value contains that channel's Float64 values as little-endian bit patterns.
+        case powerSpectralDensityByChannelFloat64LE
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.startTimeSeconds = try container.decode(Double.self, forKey: .startTimeSeconds)
+        self.sampleCount = try container.decode(Int.self, forKey: .sampleCount)
+
+        if container.contains(.powerSpectralDensityByChannelFloat64LE) {
+            let encodedChannels = try container.decode([Data].self, forKey: .powerSpectralDensityByChannelFloat64LE)
+            self.powerSpectralDensityByChannel = try Self.decodeFloat64Channels(encodedChannels, codingPath: container.codingPath)
+        } else {
+            self.powerSpectralDensityByChannel = try container.decode([[Double]].self, forKey: .powerSpectralDensityByChannel)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(startTimeSeconds, forKey: .startTimeSeconds)
+        try container.encode(sampleCount, forKey: .sampleCount)
+        try container.encode(
+            powerSpectralDensityByChannel.map(Self.encodeFloat64Channel),
+            forKey: .powerSpectralDensityByChannelFloat64LE
+        )
+    }
+
+    private static func encodeFloat64Channel(_ channel: [Double]) -> Data {
+        // Convert the bit patterns before copying so the on-disk representation is
+        // explicitly little-endian even if this code is ever run on a big-endian host.
+        let words = channel.map { $0.bitPattern.littleEndian }
+        return words.withUnsafeBytes { Data($0) }
+    }
+
+    private static func decodeFloat64Channels(_ encodedChannels: [Data], codingPath: [CodingKey]) throws -> [[Double]] {
+        try encodedChannels.enumerated().map { channelIndex, data in
+            let stride = MemoryLayout<UInt64>.stride
+            guard data.count % stride == 0 else {
+                let path = codingPath + [CodingKeys.powerSpectralDensityByChannelFloat64LE, ArrayCodingKey(index: channelIndex)]
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: path,
+                    debugDescription: "Spectrum Float64 channel data length " + String(data.count) + " is not divisible by " + String(stride)
+                ))
+            }
+
+            var words = [UInt64](repeating: 0, count: data.count / stride)
+            words.withUnsafeMutableBytes { destination in
+                data.withUnsafeBytes { source in
+                    destination.copyBytes(from: source)
+                }
+            }
+            return words.map { Double(bitPattern: UInt64(littleEndian: $0)) }
+        }
+    }
+
+    private struct ArrayCodingKey: CodingKey {
+        let intValue: Int?
+        let stringValue: String
+
+        init(index: Int) {
+            self.intValue = index
+            self.stringValue = "\(index)"
+        }
+
+        init?(intValue: Int) {
+            self.intValue = intValue
+            self.stringValue = "\(intValue)"
+        }
+
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+            self.intValue = Int(stringValue)
+        }
+    }
 }
 
 public struct SpectrumFeatures: Codable, Sendable, Equatable {

@@ -36,10 +36,45 @@ struct HeadphoneEntry: Codable, Identifiable, Hashable {
     var configuration = "原始测量配置"
 }
 
+struct RecordingSegment: Codable, Hashable {
+    var id: UUID
+    var audioPath: String
+    var featurePath: String?
+    var mediaStartSeconds: Double?
+    var capturedSeconds: Double
+    var sampleRate: Double?
+    var channels: Int?
+    var droppedFrames: UInt64?
+    var contentSHA256: String?
+
+    init(
+        id: UUID = UUID(),
+        audioPath: String,
+        featurePath: String? = nil,
+        mediaStartSeconds: Double? = nil,
+        capturedSeconds: Double,
+        sampleRate: Double? = nil,
+        channels: Int? = nil,
+        droppedFrames: UInt64? = nil,
+        contentSHA256: String? = nil
+    ) {
+        self.id = id
+        self.audioPath = audioPath
+        self.featurePath = featurePath
+        self.mediaStartSeconds = mediaStartSeconds
+        self.capturedSeconds = capturedSeconds
+        self.sampleRate = sampleRate
+        self.channels = channels
+        self.droppedFrames = droppedFrames
+        self.contentSHA256 = contentSHA256
+    }
+}
+
 struct TrackEntry: Codable, Identifiable, Hashable {
     var id = UUID()
     var title: String
     var artist: String
+    var album: String?
     var neteaseID: String?
     var sourceURL: String?
     var audioPath: String?
@@ -68,7 +103,26 @@ struct TrackEntry: Codable, Identifiable, Hashable {
     var sourceBundleIdentifier: String?
     var sourceApplicationName: String?
     var metadataSource: String?
-    var analyzed: Bool { featurePath != nil }
+    var recordingSegments: [RecordingSegment]?
+    var systemItemIdentifier: String?
+    var analyzed: Bool { featurePath != nil || analysisSegments.contains { $0.featurePath != nil } }
+    /// New segmented recordings use the persisted list. Older tracks keep
+    /// their single-file fields and are exposed as one legacy segment.
+    var analysisSegments: [RecordingSegment] {
+        if let recordingSegments { return recordingSegments }
+        guard let audioPath, !audioPath.isEmpty else { return [] }
+        return [RecordingSegment(
+            id: id,
+            audioPath: audioPath,
+            featurePath: featurePath,
+            mediaStartSeconds: mediaStartSeconds,
+            capturedSeconds: capturedSeconds,
+            sampleRate: sampleRate,
+            channels: channels,
+            droppedFrames: droppedFrames,
+            contentSHA256: contentSHA256
+        )]
+    }
     var coverageLabel: String { audioPath == nil ? "仅歌曲信息" : (isFull ? "完整文件" : "已采 \(durationLabel(capturedSeconds))") }
 }
 

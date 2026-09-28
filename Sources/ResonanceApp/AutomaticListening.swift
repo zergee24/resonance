@@ -58,9 +58,9 @@ extension AppModel {
         automaticListeningTick()
     }
 
-    /// Select the most recent analyzed recording only when the player exposed
-    /// an exact 网易云 ID. Titles and candidate metadata are never used to
-    /// guess that two recordings are the same song.
+    /// Select an analyzed recording using exact 网易云 ID first, then the
+    /// verified source bundle plus opaque system item identity. Titles and
+    /// candidate metadata are never used to guess that two recordings match.
     func syncFollowedPlayback() {
         guard isFollowPlaying,
               let snapshot = player.snapshot,
@@ -83,6 +83,19 @@ extension AppModel {
         }
         if capture.isRecording, snapshot?.metadataSource == .systemPlayer, player.systemPlayerIssue != nil {
             captureHadMetadataGap = true
+        }
+        if capture.isRecording,
+           captureIsAutomatic,
+           let snapshot,
+           let identity = captureIdentity,
+           identity.candidateKey == snapshot.candidateKey,
+           let activeTrackID = captureTrackID,
+           let activeTrack = tracks.first(where: { $0.id == activeTrackID }),
+           let currentPosition = snapshot.currentTime,
+           RecordingContinuation.isWithinCoveredRange(for: activeTrack, currentPosition: currentPosition) {
+            finishCapture(boundaryNote: "当前采集已进入既有覆盖范围，自动结束本段。")
+            automaticListeningPolicy.allowCaptureRetry()
+            automaticListeningStatus = "已到达既有覆盖范围 · 等待未覆盖片段"
         }
         // Keep the observer independent of the currently visible page. Losing
         // identity is a recording boundary even when no player event arrives.
@@ -139,45 +152,103 @@ extension AppModel {
             automaticListeningStatus = "手动采集中；自动采集等待下一播放段"
             return
         }
+        var sessionTrack: TrackEntry?
         if automaticHistorySessionID != sessionID {
-            let cachedTrack = latestAnalyzedTrack(for: snapshot.trackID)
-            var track = TrackEntry(
+            var track = RecordingContinuation.matchingTrack(for: snapshot, in: tracks) ?? TrackEntry(
                 title: snapshot.title ?? "网易云 \(snapshot.trackID ?? "未识别歌曲")",
-                artist: snapshot.artist ?? "", neteaseID: snapshot.trackID,
+                artist: snapshot.artist ?? "", album: snapshot.album, neteaseID: snapshot.trackID,
                 sourceURL: snapshot.trackURL?.absoluteString, duration: snapshot.duration,
                 source: "自动听歌记录"
             )
-            track.sourceBundleIdentifier = snapshot.sourceBundleIdentifier
-            track.sourceApplicationName = snapshot.sourceApplicationName
-            track.metadataSource = snapshot.metadataSource.rawValue
-            track.sourceProcessID = snapshot.sourceProcessIdentifier
-            track.mediaStartSeconds = snapshot.currentTime
+            var metadataChanged = false
+            if track.neteaseID == nil, let value = snapshot.trackID, !value.isEmpty {
+                track.neteaseID = value
+                metadataChanged = true
+            }
+            if track.sourceURL == nil, let value = snapshot.trackURL?.absoluteString, !value.isEmpty {
+                track.sourceURL = value
+                metadataChanged = true
+            }
+            if (track.album ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let value = snapshot.album,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                track.album = value
+                metadataChanged = true
+            }
+            if track.sourceBundleIdentifier == nil, let value = snapshot.sourceBundleIdentifier, !value.isEmpty {
+                track.sourceBundleIdentifier = value
+                metadataChanged = true
+            }
+            if track.sourceApplicationName == nil, let value = snapshot.sourceApplicationName, !value.isEmpty {
+                track.sourceApplicationName = value
+                metadataChanged = true
+            }
+            if track.metadataSource == nil {
+                track.metadataSource = snapshot.metadataSource.rawValue
+                metadataChanged = true
+            }
+            if track.sourceProcessID == nil, let value = snapshot.sourceProcessIdentifier {
+                track.sourceProcessID = value
+                metadataChanged = true
+            }
+            if let value = snapshot.systemItemIdentifier, !value.isEmpty, track.systemItemIdentifier != value {
+                track.systemItemIdentifier = value
+                metadataChanged = true
+            }
+            if track.duration == nil, let value = snapshot.duration, value.isFinite, value > 0 {
+                track.duration = value
+                metadataChanged = true
+            }
+            if track.mediaStartSeconds == nil, let value = snapshot.currentTime {
+                track.mediaStartSeconds = value
+                metadataChanged = true
+            }
             do {
-                try saveTrack(track)
+                if metadataChanged || tracks.contains(where: { $0.id == track.id }) == false {
+                    try saveTrack(track)
+                }
                 automaticHistorySessionID = sessionID
                 automaticHistoryTrackID = track.id
+                sessionTrack = track
                 if isFollowPlaying {
-                    if let cachedTrack {
-                        if selectedTrackID != cachedTrack.id {
-                            selectedTrackID = cachedTrack.id
-                            recompute()
-                        }
-                    } else {
+                    if selectedTrackID != track.id {
                         selectedTrackID = track.id
+                        recompute()
                     }
                 }
             } catch {
                 automaticListeningStatus = "歌曲信息未保存：\(error.localizedDescription)"
                 return
             }
+        } else if let trackID = automaticHistoryTrackID {
+            sessionTrack = tracks.first(where: { $0.id == trackID })
         }
         if capture.isRecording {
             automaticListeningStatus = "正在连续采集 · \(snapshot.title ?? "当前歌曲")"
             return
         }
         guard observation.readyToCapture, captureStartTask == nil else { return }
+        guard let sessionTrack else { return }
+        switch RecordingContinuation.decision(
+            for: sessionTrack,
+            duration: snapshot.duration,
+            currentPosition: snapshot.currentTime
+        ).action {
+        case .reuseExisting:
+            automaticListeningStatus = "已有足够覆盖 · 复用已保存录音"
+            return
+        case .waitForUncoveredPosition:
+            automaticListeningStatus = "当前位置已采过 · 等待未覆盖片段"
+            return
+        case .capture:
+            break
+        }
+        guard !capture.hasPendingSetup else {
+            automaticListeningStatus = "等待上次音频启动清理"
+            return
+        }
         automaticListeningPolicy.markCaptureAttempted()
-        beginCapture(automatically: true, trackID: automaticHistoryTrackID)
+        beginCapture(automatically: true, trackID: sessionTrack.id)
     }
 
     func installPlayerEvents() {
@@ -224,7 +295,7 @@ extension AppModel {
             if isFollowPlaying { selectedTrackID = nil }
             return
         }
-        guard let cachedTrack = latestAnalyzedTrack(for: snapshot.trackID) else {
+        guard let cachedTrack = RecordingContinuation.matchingAnalyzedTrack(for: snapshot, in: tracks) else {
             selectedTrackID = nil
             return
         }
@@ -232,14 +303,6 @@ extension AppModel {
             selectedTrackID = cachedTrack.id
             recompute()
         }
-    }
-
-    private func latestAnalyzedTrack(for trackID: String?) -> TrackEntry? {
-        guard let trackID = trackID?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trackID.isEmpty else { return nil }
-        return tracks
-            .filter { $0.analyzed && $0.neteaseID?.trimmingCharacters(in: .whitespacesAndNewlines) == trackID }
-            .max { $0.importedAt < $1.importedAt }
     }
 
     private func sourceLabel(for snapshot: PlayerSnapshot) -> String {

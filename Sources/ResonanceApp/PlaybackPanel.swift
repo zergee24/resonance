@@ -215,7 +215,7 @@ extension AppModel {
     }
 
     func finishCapture(boundaryNote: String? = nil, summaryOverride: CaptureSummary? = nil) {
-        guard let summary = summaryOverride ?? capture.stop(), let database else { return }
+        guard let summary = summaryOverride ?? capture.stop(), database != nil else { return }
         let wallClockStart = captureStartedAt
         captureStartedAt = nil
         let identity = captureIdentity
@@ -249,69 +249,108 @@ extension AppModel {
         if let mediaStart = identity?.currentTime {
             notes.append("播放器报告位置约 \(String(format: "%.1f", mediaStart)) 秒，仅作备注。")
         }
-        var track = TrackEntry(title: identity?.title ?? "未识别片段 \(stoppedAt.formatted(date: .omitted, time: .shortened))", artist: identity?.artist ?? "", neteaseID: identity?.trackID, sourceURL: identity?.trackURL?.absoluteString, audioPath: summary.destination.path, duration: identity?.duration, capturedSeconds: summary.duration, sampleRate: summary.sampleRate, channels: summary.channelCount, isFull: false, processingState: "音频已保存，等待分析", source: automatic ? "自动听歌采集" : "网易云进程采集")
-        if let storedID { track.id = storedID }
-        track.analysisNotes = notes
-        track.mediaStartSeconds = identity?.currentTime
-        track.wallClockStartedAt = wallClockStart
-        track.droppedFrames = summary.droppedFrames
-        track.sourceProcessID = processID
-        track.sourceBundleIdentifier = identity?.sourceBundleIdentifier
-        track.sourceApplicationName = identity?.sourceApplicationName
-        track.metadataSource = identity?.metadataSource.rawValue
+        var track: TrackEntry
+        if let storedID, let existing = tracks.first(where: { $0.id == storedID }) {
+            // Automatic listening creates a metadata row before capture. Keep
+            // that row and append a segment; never replace an earlier CAF or
+            // its playlist/source metadata with this later boundary.
+            track = existing
+            if let title = identity?.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+                track.title = title
+            }
+            if let artist = identity?.artist?.trimmingCharacters(in: .whitespacesAndNewlines), !artist.isEmpty {
+                track.artist = artist
+            }
+            track.neteaseID = track.neteaseID ?? identity?.trackID
+            track.sourceURL = track.sourceURL ?? identity?.trackURL?.absoluteString
+            track.duration = track.duration ?? identity?.duration
+        } else {
+            track = TrackEntry(
+                title: identity?.title ?? "未识别片段 \(stoppedAt.formatted(date: .omitted, time: .shortened))",
+                artist: identity?.artist ?? "",
+                neteaseID: identity?.trackID,
+                sourceURL: identity?.trackURL?.absoluteString,
+                duration: identity?.duration,
+                processingState: "音频已保存，等待分析",
+                source: automatic ? "自动听歌采集" : "网易云进程采集"
+            )
+        }
+        track.analysisNotes = (track.analysisNotes ?? []) + notes
+        track.mediaStartSeconds = track.mediaStartSeconds ?? identity?.currentTime
+        track.wallClockStartedAt = track.wallClockStartedAt ?? wallClockStart
+        track.sourceProcessID = track.sourceProcessID ?? processID
+        track.sourceBundleIdentifier = track.sourceBundleIdentifier ?? identity?.sourceBundleIdentifier
+        track.sourceApplicationName = track.sourceApplicationName ?? identity?.sourceApplicationName
+        track.album = track.album ?? identity?.album
+        track.systemItemIdentifier = track.systemItemIdentifier ?? identity?.systemItemIdentifier
+        track.metadataSource = track.metadataSource ?? identity?.metadataSource.rawValue
+
+        let captureFailure: (state: String, message: String)?
+        if let writerError = summary.writerError {
+            captureFailure = ("采集写入失败", writerError)
+        } else if summary.formatMismatchFrames > 0 {
+            captureFailure = ("采集格式无效", "采集格式中途变化，此段未用于匹配。")
+        } else if !summary.hasAudioData {
+            captureFailure = ("采集无有效音频", "没有采到有效音频。请确认网易云正在播放，且已允许共鸣录制系统音频。")
+        } else {
+            captureFailure = nil
+        }
+
+        // Keep a failed tail visible without attaching it to a successful
+        // prefix. This lets the prefix remain matchable and recoverable.
+        if let captureFailure {
+            track.rawAudioPath = track.rawAudioPath ?? summary.destination.path
+            track.processingState = captureFailure.state
+            track.error = captureFailure.message
+            do { try saveTrack(track) } catch { report(error) }
+            return
+        }
+
+        let segment = RecordingSegment(
+            audioPath: summary.destination.path,
+            mediaStartSeconds: identity?.currentTime,
+            capturedSeconds: summary.duration,
+            sampleRate: summary.sampleRate,
+            channels: summary.channelCount,
+            droppedFrames: summary.droppedFrames
+        )
+        RecordingContinuation.append(segment, to: &track)
+        track.audioPath = track.audioPath ?? segment.audioPath
+        // A newly appended segment invalidates the aggregate track artifact.
+        // Existing segment feature paths remain in recordingSegments and are
+        // reused by the analysis queue.
+        track.featurePath = nil
+        track.contentSHA256 = nil
+        let union = RecordingContinuation.unionCoverage(for: track.analysisSegments)
+        track.capturedSeconds = union.isEmpty
+            ? track.analysisSegments.reduce(0) { $0 + max(0, $1.capturedSeconds) }
+            : union.reduce(0) { $0 + $1.durationSeconds }
+        track.sampleRate = track.sampleRate ?? summary.sampleRate
+        track.channels = track.channels ?? summary.channelCount
+        track.isFull = false
+        track.processingState = "音频已保存，等待分析"
+        track.error = nil
         // Persist before analysis so quitting or a numerical failure cannot
         // erase the history entry or leave an unreferenced successful capture.
         do { try saveTrack(track) } catch { report(error); return }
-        let previousAnalysis = analysisTask
-        let revision = UUID()
-        analysisRevision = revision
-        busy = true
-        analysisTask = Task {
-            await previousAnalysis?.value
-            let analysisActivity = ProcessInfo.processInfo.beginActivity(
-                options: [.background, .idleSystemSleepDisabled],
-                reason: "Resonance audio analysis"
-            )
-            defer { ProcessInfo.processInfo.endActivity(analysisActivity) }
-            busy = true
-            defer { if analysisRevision == revision { busy = false } }
-            do {
-                if let error = summary.writerError { throw ListeningCaptureError.invalid(error) }
-                guard summary.formatMismatchFrames == 0 else { throw ListeningCaptureError.invalid("采集格式中途变化，此段未用于匹配。") }
-                guard summary.hasAudioData else { throw ListeningCaptureError.invalid("没有采到有效音频。请确认网易云正在播放，且已允许共鸣录制系统音频。") }
-                let audioDuration = summary.duration
-                status = "正在分析已录片段 · \(track.title)"
-                let coverage = try Coverage(
-                    kind: .partial,
-                    mediaDurationSeconds: identity?.duration,
-                    recordedDurationSeconds: audioDuration,
-                    intervals: [],
-                    hasUnexplainedGaps: summary.droppedFrames > 0,
-                    identityConfirmed: identity?.trackID != nil
-                )
-                let id = track.id, destination = summary.destination
-                let analyzed = try await Task.detached(priority: .userInitiated) { (try SpectrumAnalyzer().analyze(fileURL: destination, coverage: coverage, recordingID: id), try LocalStore.audioDigest(destination)) }.value
-                track.contentSHA256 = analyzed.1
-                let artifactURL = database.featureURL(id: id)
-                try await Task.detached(priority: .utility) { try LocalStore.writeArtifact(analyzed.0, to: artifactURL) }.value
-                track.featurePath = artifactURL.path
-                track.processingState = processingDeclared ? "用户备注：播放处理与候选一致" : "播放器输出；处理链未知"
-                try saveTrack(track)
-                if !automatic || (isFollowPlaying && player.snapshot?.candidateKey == identity?.candidateKey) {
-                    selectedTrackID = track.id
-                }
-                status = "已分析全部有效采集段 · \(String(format: "%.1f", audioDuration)) 秒 · \(track.coverageLabel)"
-                if automatic { automaticListeningStatus = "已保存：\(track.title) · \(track.coverageLabel)" }
-                recompute()
-            } catch {
-                track.error = error.localizedDescription
-                do {
-                    try saveTrack(track)
-                    if automatic { automaticListeningStatus = "音频已保留：\(error.localizedDescription)" }
-                    else { report(error) }
-                } catch { report(error) }
-            }
-        }
+        let coverage = try? Coverage(
+            kind: .partial,
+            mediaDurationSeconds: identity?.duration,
+            recordedDurationSeconds: summary.duration,
+            intervals: [],
+            hasUnexplainedGaps: summary.droppedFrames > 0,
+            identityConfirmed: identity?.trackID != nil
+        )
+        guard let coverage else { return }
+        enqueueAnalysis(
+            track: track,
+            coverage: coverage,
+            automatic: automatic,
+            selectOnCompletion: true,
+            recomputeOnCompletion: !automatic,
+            processingDeclared: processingDeclared,
+            identityCandidateKey: identity?.candidateKey
+        )
     }
 }
 

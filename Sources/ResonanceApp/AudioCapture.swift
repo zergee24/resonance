@@ -137,6 +137,9 @@ public final class AudioCapture: ObservableObject {
     @Published public private(set) var status: AudioCaptureStatus = .idle
     @Published public private(set) var meter: Float = 0
     @Published public private(set) var isRecording = false
+    /// A cancelled setup can still own Core Audio objects while its setup
+    /// queue finishes cleanup. Callers must wait before attempting a new song.
+    public var hasPendingSetup: Bool { activeStartID != nil }
     /// Receives the summary when the meter detects a writer failure and stops
     /// the session automatically. User-requested `stop()` does not call this.
     public var onUnexpectedStop: ((CaptureSummary) -> Void)?
