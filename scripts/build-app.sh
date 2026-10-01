@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "${0:A:h}/.."
 configuration="${1:-release}"
-swift build -c "$configuration"
+swift build -c "$configuration" --jobs 1
 binary_dir="$(swift build -c "$configuration" --show-bin-path)"
 bundle="$PWD/dist/共鸣.app"
 icon_source="$PWD/Support/AppIcon.png"

@@ -20,6 +20,8 @@ private struct CoreVerification {
 
         try verifyCurveImport(root: root)
         try verifySpectrumAndMatch()
+        try verifyStereoChannelCurveMatching()
+        try verifyEvidenceBenchmark()
         try verifyEnergyIntegration()
         try verifyExtendedBands()
         try verifyCAFDecode()
@@ -169,6 +171,17 @@ private struct CoreVerification {
             values: [120, 120, 120],
             isReference: true
         )
+        let veryShiftedShapedCurve = try makeCurve(
+            name: "shaped +1e6",
+            frequencies: [20, 1_000, 20_000],
+            values: [1_000_003, 999_999, 1_000_004]
+        )
+        let veryShiftedShapedReference = try makeCurve(
+            name: "reference +1e6",
+            frequencies: [20, 1_000, 20_000],
+            values: [1_000_000, 1_000_000, 1_000_000],
+            isReference: true
+        )
         let baseShape = Matcher().match(
             features: features,
             headphone: Headphone(name: "shaped", owned: true, curve: shapedCurve, referenceID: shapedReference.id),
@@ -184,11 +197,21 @@ private struct CoreVerification {
             headphone: Headphone(name: "shaped", owned: true, curve: shapedCurve, referenceID: shiftedShapedReference.id),
             reference: shiftedShapedReference
         )
+        let veryShiftedHeadphone = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "shaped +1e6", owned: true, curve: veryShiftedShapedCurve, referenceID: shapedReference.id),
+            reference: shapedReference
+        )
+        let veryShiftedReferenceResult = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "shaped", owned: true, curve: shapedCurve, referenceID: veryShiftedShapedReference.id),
+            reference: veryShiftedShapedReference
+        )
         let baseC = try require(baseShape.c, "base C is missing")
         let baseD = try require(baseShape.d, "base D is missing")
         let baseDHigh = try require(baseShape.dHigh, "base D_high is missing")
         let baseBandGain = try require(baseShape.frequencyBands.first(where: { $0.band.lowerHz == 16_000 })?.relativeGainDB, "base relative band gain is missing")
-        for result in [shiftedHeadphone, shiftedReferenceResult] {
+        for result in [shiftedHeadphone, shiftedReferenceResult, veryShiftedHeadphone, veryShiftedReferenceResult] {
             let shiftedC = try require(result.c, "shifted C is missing")
             let shiftedD = try require(result.d, "shifted D is missing")
             let shiftedDHigh = try require(result.dHigh, "shifted D_high is missing")
@@ -198,7 +221,7 @@ private struct CoreVerification {
             let bandGain = try require(result.frequencyBands.first(where: { $0.band.lowerHz == 16_000 })?.relativeGainDB, "shifted relative band gain is missing")
             try check(abs(bandGain - baseBandGain) < 1e-10, "relative band gain changed after a global curve/reference offset")
         }
-        print("PASS level-offset invariance: C/D/D_high and relative band gain are unchanged by +/-120 dB curve/reference shifts")
+        print("PASS level-offset invariance: C/D/D_high and relative band gain are unchanged by +/-120 dB and +1e6 dB curve/reference shifts")
 
         let lowHighCoverage = try Coverage(kind: .complete, intervals: [try TimeRange(startSeconds: 0, endSeconds: 1)])
         let lowHighBins = [20.0, 10_000, 12_000, 16_000]
@@ -252,6 +275,129 @@ private struct CoreVerification {
         let legacy = try JSONDecoder().decode(Coverage.self, from: legacyJSON)
         try check(legacy.recordedDurationSeconds == nil && !legacy.isUsable, "legacy coverage without recorded duration changed meaning")
         print("PASS C/D/D_high and guard conditions: missing reference has no numbers, explicit reference works, unknown/gaps estimate from PSD, non-finite PSD rejected")
+    }
+
+    private static func verifyStereoChannelCurveMatching() throws {
+        let coverage = try Coverage(
+            kind: .complete,
+            intervals: [try TimeRange(startSeconds: 0, endSeconds: 1)],
+            identityConfirmed: true
+        )
+        let features = SpectrumFeatures(
+            sampleRate: 48_000,
+            channelCount: 2,
+            frequencyBinsHz: [20, 1_000, 20_000],
+            frames: [SpectrumFrame(
+                startTimeSeconds: 0,
+                sampleCount: 1_024,
+                powerSpectralDensityByChannel: [[1, 1, 1], [0, 0, 0]]
+            )],
+            durationSeconds: 1,
+            coverage: coverage,
+            validMinHz: 20,
+            validMaxHz: 20_000,
+            frequencyValidity: .measuredContent,
+            format: AudioFormatMetadata(sampleRate: 48_000, channelCount: 2),
+            parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 0.02)
+        )
+        let reference = try makeCurve(name: "stereo reference", frequencies: [20, 1_000, 20_000], values: [0, 0, 0], isReference: true)
+        let left = try makeCurve(name: "left +6/0/-6", frequencies: [20, 1_000, 20_000], values: [6, 0, -6])
+        let right = try makeCurve(name: "right -6/0/+6", frequencies: [20, 1_000, 20_000], values: [-6, 0, 6])
+        let result = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "stereo", owned: true, curve: left, rightCurve: right, referenceID: reference.id),
+            reference: reference
+        )
+        try check((result.c ?? 0) > 1e-6, "stereo C still hides opposing channel curves")
+        try check((result.d ?? 0) > 1e-6, "stereo D still averages opposing channel curves")
+        try check((result.dHigh ?? 0) > 1e-6, "stereo D_high still averages opposing channel curves")
+
+        let fallback = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "fallback", owned: true, curve: left, referenceID: reference.id),
+            reference: reference
+        )
+        let identicalStereo = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "identical stereo", owned: true, curve: left, rightCurve: left, referenceID: reference.id),
+            reference: reference
+        )
+        try check(abs((fallback.c ?? .nan) - (identicalStereo.c ?? .nan)) < 1e-12, "identical stereo curves changed C")
+        try check(abs((fallback.d ?? .nan) - (identicalStereo.d ?? .nan)) < 1e-12, "identical stereo curves changed D")
+        try check(abs((fallback.dHigh ?? .nan) - (identicalStereo.dHigh ?? .nan)) < 1e-12, "identical stereo curves changed D_high")
+        try check(fallback.frequencyBands.count == identicalStereo.frequencyBands.count, "identical stereo curves changed evidence band count")
+        for (fallbackBand, stereoBand) in zip(fallback.frequencyBands, identicalStereo.frequencyBands) {
+            try check(abs((fallbackBand.inputEnergyFraction ?? .nan) - (stereoBand.inputEnergyFraction ?? .nan)) < 1e-12, "identical stereo curves changed evidence energy")
+            try check(abs((fallbackBand.relativeGainDB ?? .nan) - (stereoBand.relativeGainDB ?? .nan)) < 1e-12, "identical stereo curves changed evidence gain")
+            try check(abs((fallbackBand.deviationContribution ?? .nan) - (stereoBand.deviationContribution ?? .nan)) < 1e-12, "identical stereo curves changed evidence deviation")
+        }
+
+        let limitedRight = try Curve(
+            name: "right measured from 1 kHz",
+            points: [20, 1_000, 20_000].map { try! CurvePoint(frequencyHz: $0, decibels: 1) },
+            source: "verify-core",
+            measurementSystem: "synthetic",
+            validMinHz: 1_000
+        )
+        let limitedEQ = try Curve(
+            name: "EQ measured from 1 kHz",
+            points: [20, 1_000, 20_000].map { try! CurvePoint(frequencyHz: $0, decibels: 0) },
+            source: "verify-core",
+            measurementSystem: "synthetic",
+            validMinHz: 1_000
+        )
+        let limitedSupport = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "limited support", owned: true, curve: left, rightCurve: limitedRight, referenceID: reference.id, eqCurve: limitedEQ),
+            reference: reference
+        )
+        try check(limitedSupport.isEvaluable && limitedSupport.evaluatedMinHz == 1_000, "stereo/EQ support was extrapolated instead of intersected")
+        print("PASS stereo curve probe: opposing +/-6 dB channel curves remain visible; identical curves preserve the fallback result")
+    }
+
+    private static func verifyEvidenceBenchmark() throws {
+        let binCount = 1_025
+        let frameCount = 120
+        let frequencies = (0..<binCount).map { index in
+            20 + (19_980 * Double(index) / Double(binCount - 1))
+        }
+        let channel = Array(repeating: 1.0, count: binCount)
+        let frames = (0..<frameCount).map { index in
+            SpectrumFrame(
+                startTimeSeconds: Double(index) * 0.02,
+                sampleCount: 1_024,
+                powerSpectralDensityByChannel: [channel, channel]
+            )
+        }
+        let coverage = try Coverage(
+            kind: .complete,
+            intervals: [try TimeRange(startSeconds: 0, endSeconds: Double(frameCount) * 0.02)],
+            identityConfirmed: true
+        )
+        let features = SpectrumFeatures(
+            sampleRate: 48_000,
+            channelCount: 2,
+            frequencyBinsHz: frequencies,
+            frames: frames,
+            durationSeconds: Double(frameCount) * 0.02,
+            coverage: coverage,
+            validMinHz: 20,
+            validMaxHz: 20_000,
+            frequencyValidity: .measuredContent,
+            format: AudioFormatMetadata(sampleRate: 48_000, channelCount: 2),
+            parameters: SpectrumAnalysisParameters(frameLength: 2_048, hopLength: 512, frameDurationSeconds: 0.02)
+        )
+        let reference = try makeCurve(name: "benchmark reference", frequencies: [20, 20_000], values: [0, 0], isReference: true)
+        let curve = try makeCurve(name: "benchmark curve", frequencies: [20, 20_000], values: [2, -2])
+        let start = DispatchTime.now().uptimeNanoseconds
+        let result = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "benchmark", owned: true, curve: curve, referenceID: reference.id),
+            reference: reference
+        )
+        let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        try check(result.isEvaluable, "evidence benchmark did not evaluate")
+        print(String(format: "PASS evidence benchmark: %d frames x %d bins, %.2f ms", frameCount, binCount, elapsedMilliseconds))
     }
 
     private static func verifyEnergyIntegration() throws {

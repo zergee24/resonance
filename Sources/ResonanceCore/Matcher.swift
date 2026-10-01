@@ -20,7 +20,7 @@ public struct Matcher: Sendable {
             highFrequencyMinimumHz: Double = 10_000,
             highFrequencyMaximumHz: Double = 20_000,
             minimumHighEnergyRatio: Double = 1e-4,
-            modelVersion: String = "2-cd-c-high-normalized"
+            modelVersion: String = "3-cd-c-high-channel-linear"
         ) {
             self.minimumFrequencyHz = minimumFrequencyHz
             self.maximumFrequencyHz = maximumFrequencyHz
@@ -72,6 +72,7 @@ public struct Matcher: Sendable {
         guard features.frequencyBinsHz.count >= 2,
               features.frequencyBinsHz.allSatisfy(\.isFinite),
               zip(features.frequencyBinsHz, features.frequencyBinsHz.dropFirst()).allSatisfy({ $0.0 < $0.1 }),
+              validCellEdges(features),
               features.frames.allSatisfy({ frame in
                   frame.powerSpectralDensityByChannel.count == features.channelCount
                       && frame.powerSpectralDensityByChannel.allSatisfy {
@@ -84,7 +85,7 @@ public struct Matcher: Sendable {
                 headphone: headphone,
                 reference: reference,
                 reason: .invalidInput,
-                message: "频率轴或各声道 PSD 形状不一致，暂时不能计算。"
+                message: "频率轴、显式 cell 边界或各声道 PSD 形状不一致，暂时不能计算。"
             )
         }
 
@@ -122,8 +123,17 @@ public struct Matcher: Sendable {
         headphoneCurve: Curve,
         reference: Curve
     ) -> MatchResult {
-        let curveMinimum = max(headphoneCurve.validMinHz, reference.validMinHz)
-        let curveMaximum = min(headphoneCurve.validMaxHz, reference.validMaxHz)
+        // A stereo measurement has one transfer curve per measured channel.
+        // Intersect only the curves that can contribute to the recorded
+        // channels; a right-channel curve must not constrain a mono recording.
+        let channelCurves = curvesForChannels(
+            leftCurve: headphoneCurve,
+            rightCurve: headphone.rightCurve,
+            channelCount: features.channelCount
+        )
+        let supportCurves = channelCurves + (headphone.eqCurve.map { [$0] } ?? [])
+        let curveMinimum = max(supportCurves.map(\.validMinHz).max() ?? headphoneCurve.validMinHz, reference.validMinHz)
+        let curveMaximum = min(supportCurves.map(\.validMaxHz).min() ?? headphoneCurve.validMaxHz, reference.validMaxHz)
         let minimum = max(configuration.minimumFrequencyHz, features.validMinHz, curveMinimum)
         let maximum = min(configuration.maximumFrequencyHz, features.validMaxHz, curveMaximum)
         guard minimum.isFinite, maximum.isFinite, minimum < maximum else {
@@ -179,11 +189,11 @@ public struct Matcher: Sendable {
             )
         }
 
-        guard let deltas = deltaValues(
+        guard let channelDeltas = deltaValuesByChannel(
             bins: bins,
             frequencies: features.frequencyBinsHz,
+            channelCurves: channelCurves,
             headphone: headphone,
-            headphoneCurve: headphoneCurve,
             reference: reference
         ) else {
             return unevaluable(
@@ -194,11 +204,11 @@ public struct Matcher: Sendable {
                 message: "共同频段内无法从曲线取得完整数值，暂时不能计算。"
             )
         }
-        guard let detailDeltas = deltaValues(
+        guard let detailChannelDeltas = deltaValuesByChannel(
             bins: detailBins,
             frequencies: features.frequencyBinsHz,
+            channelCurves: channelCurves,
             headphone: headphone,
-            headphoneCurve: headphoneCurve,
             reference: reference
         ) else {
             return unevaluable(
@@ -214,76 +224,87 @@ public struct Matcher: Sendable {
             frequencies: features.frequencyBinsHz,
             indices: bins,
             lowerBound: minimum,
-            upperBound: maximum
+            upperBound: maximum,
+            cellEdges: validatedCellEdges(features)
         )
         let detailWidths = binWidths(
             frequencies: features.frequencyBinsHz,
             indices: detailBins,
             lowerBound: detailMinimum,
-            upperBound: detailMaximum
+            upperBound: detailMaximum,
+            cellEdges: validatedCellEdges(features)
         )
         let detailTotalEnergy = totalEnergy(
             features: features,
             bins: detailBins,
             widths: detailWidths
         )
-        let cDeltaOffset = deltas.max() ?? 0
-        let normalizedDeltas = deltas.map { $0 - cDeltaOffset }
         var totalEnergy = 0.0
-        var highEnergy = 0.0
-        var weightedDelta = 0.0
+        let gainAnchor = channelDeltas.first?.first ?? 0
+        var weightedRelativeDelta = 0.0
+        // Keep one small aggregate per channel/bin. Computing variance from
+        // raw second moments (sum(E * delta^2) - gain^2 * sum(E)) loses all
+        // precision when the whole curve has a large constant offset.
+        var energyByChannelAndBin = channelDeltas.map { _ in
+            Array(repeating: 0.0, count: bins.count)
+        }
         var frameContributions: [(weight: Double, value: Double)] = []
-        var bandEnergyByFrame: [[Double]] = []
 
         for frame in features.frames {
-            let powers = averagedPower(frame: frame, channelCount: features.channelCount, indices: bins)
-            guard powers.count == bins.count else { continue }
-            let energies = zip(powers, widths).map { power, width in
-                max(0, power) * width
-            }
-            let frameEnergy = energies.reduce(0, +)
-            guard frameEnergy.isFinite, frameEnergy > 0 else { continue }
-            totalEnergy += frameEnergy
-            weightedDelta += zip(energies, deltas).reduce(0) { $0 + $1.0 * $1.1 }
-
-            // C keeps the stereo channels as separate dimensions. D is
-            // channel-linear and can use the averaged PSD above; JS over an
-            // averaged stereo spectrum would otherwise hide left/right
-            // differences before measuring the audible change.
             let channelPowerArrays = channelPowers(
                 frame: frame,
                 channelCount: features.channelCount,
                 indices: bins
             )
-            let channelEnergies = channelPowerArrays.flatMap { powers in
+            guard channelPowerArrays.count == channelDeltas.count,
+                  channelPowerArrays.allSatisfy({ $0.count == bins.count }) else { continue }
+            let channelEnergies = channelPowerArrays.map { powers in
                 zip(powers, widths).map { max(0, $0.0) * $0.1 }
             }
-            let cFrameEnergy = channelEnergies.reduce(0, +)
+            let frameEnergy = channelEnergies.reduce(0) { partial, energies in
+                partial + energies.reduce(0, +)
+            }
+            guard frameEnergy.isFinite, frameEnergy > 0 else { continue }
+            totalEnergy += frameEnergy
+            for (channelIndex, energies) in channelEnergies.enumerated() {
+                let deltas = channelDeltas[channelIndex]
+                for (localIndex, energy) in energies.enumerated() {
+                    energyByChannelAndBin[channelIndex][localIndex] += energy
+                    weightedRelativeDelta += energy * (deltas[localIndex] - gainAnchor)
+                }
+            }
+
+            // C keeps stereo channels as separate dimensions. The offset is
+            // chosen from the active channels in this frame, so a silent
+            // right channel cannot affect a left-only recording through its
+            // unrelated response curve.
+            let activeDeltaOffset = channelDeltas
+                .enumerated()
+                .filter { channelIndex, _ in
+                    channelEnergies[channelIndex].reduce(0, +) > 0
+                }
+                .flatMap { $0.element }
+                .max() ?? 0
+            let cFrameEnergy = frameEnergy
             // JS only depends on relative gains. Subtracting one common
             // maximum keeps the exponent bounded without changing the
             // normalized distribution, and makes C invariant to a global
             // curve/reference level offset.
-            let cDeltas = Array(repeating: normalizedDeltas, count: channelPowerArrays.count).flatMap { $0 }
-            let q = zip(channelEnergies, cDeltas).map { energy, delta in
-                energy * safeGain(forDecibels: delta)
+            let q = channelEnergies.enumerated().flatMap { channelIndex, energies in
+                zip(energies, channelDeltas[channelIndex]).map { energy, delta in
+                    energy * safeGain(forDecibels: delta - activeDeltaOffset)
+                }
             }
+            let flattenedChannelEnergies = channelEnergies.flatMap { $0 }
             let qTotal = q.reduce(0, +)
             if cFrameEnergy.isFinite, cFrameEnergy > 0, qTotal.isFinite, qTotal > 0 {
-                let pDistribution = channelEnergies.map { $0 / cFrameEnergy }
+                let pDistribution = flattenedChannelEnergies.map { $0 / cFrameEnergy }
                 let qDistribution = q.map { $0 / qTotal }
                 let js = jsDivergence(p: pDistribution, q: qDistribution)
                 if js.isFinite {
                     frameContributions.append((cFrameEnergy, js))
                 }
             }
-            if let highStart = bins.firstIndex(where: { features.frequencyBinsHz[$0] >= configuration.highFrequencyMinimumHz }),
-               let highEnd = bins.lastIndex(where: { features.frequencyBinsHz[$0] <= configuration.highFrequencyMaximumHz }),
-               highStart <= highEnd {
-                for localIndex in highStart...highEnd {
-                    highEnergy += energies[localIndex]
-                }
-            }
-            bandEnergyByFrame.append(energies)
         }
 
         guard totalEnergy.isFinite, totalEnergy > 0 else {
@@ -296,11 +317,11 @@ public struct Matcher: Sendable {
             )
         }
 
-        let globalGain = weightedDelta / totalEnergy
-        var variance = 0.0
-        for frameEnergies in bandEnergyByFrame {
-            for (index, energy) in frameEnergies.enumerated() {
-                variance += energy * pow(deltas[index] - globalGain, 2)
+        let relativeGlobalGain = weightedRelativeDelta / totalEnergy
+        let variance = energyByChannelAndBin.enumerated().reduce(0.0) { partial, channel in
+            let deltas = channelDeltas[channel.offset]
+            return partial + zip(channel.element, deltas).reduce(0.0) {
+                $0 + $1.0 * pow(($1.1 - gainAnchor) - relativeGlobalGain, 2)
             }
         }
         let d = sqrt(max(0, variance / totalEnergy))
@@ -312,30 +333,28 @@ public struct Matcher: Sendable {
             c = nil
         }
 
-        let highBinIndices = bins.filter { index in
+        let highLocalIndices = bins.indices.filter { localIndex in
+            let index = bins[localIndex]
             let frequency = features.frequencyBinsHz[index]
             return frequency >= configuration.highFrequencyMinimumHz
                 && frequency <= configuration.highFrequencyMaximumHz
         }
+        let highBinIndices = highLocalIndices.map { bins[$0] }
         let highActualMinimumHz = highBinIndices.first.map { features.frequencyBinsHz[$0] }
         let highActualMaximumHz = highBinIndices.last.map { features.frequencyBinsHz[$0] }
+        let highEnergy = energyByChannelAndBin.reduce(0.0) { partial, channelEnergies in
+            partial + highLocalIndices.reduce(0.0) { $0 + channelEnergies[$1] }
+        }
         let highRatio = highEnergy / totalEnergy
         let dHigh: Double?
         if !highBinIndices.isEmpty, highEnergy.isFinite, highEnergy > 0 {
-            var highWeightedVariance = 0.0
-            var highTotal = 0.0
-            for frame in features.frames {
-                let powers = averagedPower(frame: frame, channelCount: features.channelCount, indices: bins)
-                let energies = zip(powers, widths).map { max(0, $0.0) * $0.1 }
-                for (index, energy) in energies.enumerated() {
-                    let frequency = features.frequencyBinsHz[bins[index]]
-                    guard frequency >= configuration.highFrequencyMinimumHz,
-                          frequency <= configuration.highFrequencyMaximumHz else { continue }
-                    highTotal += energy
-                    highWeightedVariance += energy * pow(deltas[index] - globalGain, 2)
+            let highWeightedVariance = energyByChannelAndBin.enumerated().reduce(0.0) { partial, channel in
+                let deltas = channelDeltas[channel.offset]
+                return partial + highLocalIndices.reduce(0.0) {
+                    $0 + channel.element[$1] * pow((deltas[$1] - gainAnchor) - relativeGlobalGain, 2)
                 }
             }
-            dHigh = highTotal > 0 ? sqrt(max(0, highWeightedVariance / highTotal)) : nil
+            dHigh = sqrt(max(0, highWeightedVariance / highEnergy))
         } else {
             dHigh = nil
         }
@@ -345,9 +364,11 @@ public struct Matcher: Sendable {
             bands: FrequencyBand.expanded(through: detailMaximum),
             bins: detailBins,
             frequencies: features.frequencyBinsHz,
-            deltas: detailDeltas,
+            cellEdges: validatedCellEdges(features),
+            channelDeltas: detailChannelDeltas,
             totalEnergy: detailTotalEnergy,
-            globalGain: globalGain,
+            gainAnchor: gainAnchor,
+            relativeGlobalGain: relativeGlobalGain,
             commonMinimum: detailMinimum,
             commonMaximum: detailMaximum
         )
@@ -380,7 +401,7 @@ public struct Matcher: Sendable {
             frequencyValidity: features.frequencyValidity,
             completeOrPartial: features.coverage.kind,
             frequencyBands: evidence,
-            modelVersion: configuration.modelVersion
+            modelVersion: resultModelVersion(for: features)
         )
     }
 
@@ -430,6 +451,12 @@ public struct Matcher: Sendable {
         if !features.coverage.identityConfirmed {
             parts.append("歌曲身份或播放位置尚未完全核实")
         }
+        if features.compactStorage != nil {
+            parts.append(Self.compactApproximationLimitation)
+            if features.frequencyValidity == .mathematicalNyquist {
+                parts.append("频率上限仍只是 PCM 的数学 Nyquist，不证明对应频段含有实测内容")
+            }
+        }
         return parts.joined(separator: "；") + "。"
     }
 
@@ -457,21 +484,17 @@ public struct Matcher: Sendable {
             message: message,
             frequencyValidity: features.frequencyValidity,
             completeOrPartial: features.coverage.kind,
-            modelVersion: configuration.modelVersion
+            modelVersion: resultModelVersion(for: features)
         )
     }
 
-    private func averagedPower(frame: SpectrumFrame, channelCount: Int, indices: [Int]) -> [Double] {
-        let allChannels = channelPowers(frame: frame, channelCount: channelCount, indices: indices)
-        guard !allChannels.isEmpty else { return [] }
-        return indices.indices.map { index in
-            let values: [Double] = allChannels.compactMap { channel -> Double? in
-                guard index < channel.count else { return nil }
-                return channel[index]
-            }
-            guard !values.isEmpty else { return 0 }
-            return values.reduce(0, +) / Double(values.count)
-        }
+    private static let compactApproximationLimitation =
+        "compact 频谱按 cell 内 PSD 密度积分后以中心频率近似曲线权重；高 Q 峰、峰位与 20 kHz 边界可能改变，不能视为无损或与原始逐频率结果数学等价"
+
+    private func resultModelVersion(for features: SpectrumFeatures) -> String {
+        features.compactStorage == nil
+            ? configuration.modelVersion
+            : configuration.modelVersion + "-compact-v1"
     }
 
     private func channelPowers(frame: SpectrumFrame, channelCount: Int, indices: [Int]) -> [[Double]] {
@@ -486,45 +509,73 @@ public struct Matcher: Sendable {
         }
     }
 
-    private func deltaValues(
+    private func validCellEdges(_ features: SpectrumFeatures) -> Bool {
+        if features.compactStorage != nil, features.frequencyCellEdgesHz == nil { return false }
+        guard features.frequencyCellEdgesHz != nil else { return true }
+        return validatedCellEdges(features) != nil
+    }
+
+    private func validatedCellEdges(_ features: SpectrumFeatures) -> [Double]? {
+        guard let edges = features.frequencyCellEdgesHz else { return nil }
+        let frequencies = features.frequencyBinsHz
+        guard edges.count == frequencies.count + 1,
+              edges.allSatisfy(\.isFinite),
+              zip(edges, edges.dropFirst()).allSatisfy({ $0.0 < $0.1 }),
+              frequencies.indices.allSatisfy({ index in
+                  edges[index] <= frequencies[index] && frequencies[index] <= edges[index + 1]
+              }) else {
+            return nil
+        }
+        return edges
+    }
+
+    private func curvesForChannels(leftCurve: Curve, rightCurve: Curve?, channelCount: Int) -> [Curve] {
+        guard channelCount > 0 else { return [] }
+        return (0..<channelCount).map { channelIndex in
+            channelIndex == 1 ? (rightCurve ?? leftCurve) : leftCurve
+        }
+    }
+
+    private func deltaValuesByChannel(
         bins: [Int],
         frequencies: [Double],
+        channelCurves: [Curve],
         headphone: Headphone,
-        headphoneCurve: Curve,
         reference: Curve
-    ) -> [Double]? {
-        let values = bins.map { index -> Double in
-            let frequency = frequencies[index]
-            let left = headphoneCurve.value(at: frequency)
-            let headphoneDB: Double?
-            if let rightCurve = headphone.rightCurve {
-                guard let left, let right = rightCurve.value(at: frequency) else {
-                    return .nan
+    ) -> [[Double]]? {
+        var result: [[Double]] = []
+        result.reserveCapacity(channelCurves.count)
+        for curve in channelCurves {
+            var values: [Double] = []
+            values.reserveCapacity(bins.count)
+            for index in bins {
+                let frequency = frequencies[index]
+                guard let headphoneDB = curve.value(at: frequency),
+                      let referenceDB = reference.value(at: frequency) else {
+                    return nil
                 }
-                headphoneDB = (left + right) / 2
-            } else {
-                headphoneDB = left
+                var delta = headphoneDB - referenceDB
+                if let eqCurve = headphone.eqCurve {
+                    guard let eqValue = eqCurve.value(at: frequency) else { return nil }
+                    delta += eqValue
+                }
+                guard delta.isFinite else { return nil }
+                values.append(delta)
             }
-            guard let headphoneDB, let referenceDB = reference.value(at: frequency) else {
-                return .nan
-            }
-            var delta = headphoneDB - referenceDB
-            if let eqCurve = headphone.eqCurve {
-                guard let eqValue = eqCurve.value(at: frequency) else { return .nan }
-                delta += eqValue
-            }
-            return delta
+            result.append(values)
         }
-        return values.allSatisfy(\.isFinite) ? values : nil
+        return result
     }
 
     private func totalEnergy(features: SpectrumFeatures, bins: [Int], widths: [Double]) -> Double {
         var result = 0.0
         for frame in features.frames {
-            let powers = averagedPower(frame: frame, channelCount: features.channelCount, indices: bins)
-            result += zip(powers, widths).reduce(0) { partial, pair in
-                let value = pair.0.isFinite && pair.0 >= 0 ? pair.0 : 0
-                return partial + value * pair.1
+            let channelArrays = channelPowers(frame: frame, channelCount: features.channelCount, indices: bins)
+            for powers in channelArrays {
+                result += zip(powers, widths).reduce(0) { partial, pair in
+                    let value = pair.0.isFinite && pair.0 >= 0 ? pair.0 : 0
+                    return partial + value * pair.1
+                }
             }
         }
         return result.isFinite ? result : 0
@@ -534,20 +585,26 @@ public struct Matcher: Sendable {
         frequencies: [Double],
         indices: [Int],
         lowerBound: Double,
-        upperBound: Double
+        upperBound: Double,
+        cellEdges: [Double]?
     ) -> [Double] {
         indices.map { index in
             let cellLower: Double
-            if index == 0 {
-                cellLower = frequencies[index]
-            } else {
-                cellLower = (frequencies[index - 1] + frequencies[index]) / 2
-            }
             let cellUpper: Double
-            if index == frequencies.count - 1 {
-                cellUpper = frequencies[index]
+            if let cellEdges {
+                cellLower = cellEdges[index]
+                cellUpper = cellEdges[index + 1]
             } else {
-                cellUpper = (frequencies[index] + frequencies[index + 1]) / 2
+                if index == 0 {
+                    cellLower = frequencies[index]
+                } else {
+                    cellLower = (frequencies[index - 1] + frequencies[index]) / 2
+                }
+                if index == frequencies.count - 1 {
+                    cellUpper = frequencies[index]
+                } else {
+                    cellUpper = (frequencies[index] + frequencies[index + 1]) / 2
+                }
             }
             let lower = max(cellLower, lowerBound)
             let upper = min(cellUpper, upperBound)
@@ -556,18 +613,44 @@ public struct Matcher: Sendable {
         }
     }
 
-    private func cellOverlapWidth(frequencies: [Double], index: Int, lower: Double, upper: Double) -> Double {
-        let cellLower: Double
-        if index == 0 {
-            cellLower = frequencies[index]
-        } else {
-            cellLower = (frequencies[index - 1] + frequencies[index]) / 2
+    private func cellWidth(frequencies: [Double], index: Int, cellEdges: [Double]?) -> Double {
+        if let cellEdges {
+            let width = cellEdges[index + 1] - cellEdges[index]
+            return width.isFinite && width > 0 ? width : 0
         }
+        let lower = index == 0
+            ? frequencies[index]
+            : (frequencies[index - 1] + frequencies[index]) / 2
+        let upper = index == frequencies.count - 1
+            ? frequencies[index]
+            : (frequencies[index] + frequencies[index + 1]) / 2
+        let width = upper - lower
+        return width.isFinite && width > 0 ? width : 0
+    }
+
+    private func cellOverlapWidth(
+        frequencies: [Double],
+        index: Int,
+        lower: Double,
+        upper: Double,
+        cellEdges: [Double]?
+    ) -> Double {
+        let cellLower: Double
         let cellUpper: Double
-        if index == frequencies.count - 1 {
-            cellUpper = frequencies[index]
+        if let cellEdges {
+            cellLower = cellEdges[index]
+            cellUpper = cellEdges[index + 1]
         } else {
-            cellUpper = (frequencies[index] + frequencies[index + 1]) / 2
+            if index == 0 {
+                cellLower = frequencies[index]
+            } else {
+                cellLower = (frequencies[index - 1] + frequencies[index]) / 2
+            }
+            if index == frequencies.count - 1 {
+                cellUpper = frequencies[index]
+            } else {
+                cellUpper = (frequencies[index] + frequencies[index + 1]) / 2
+            }
         }
         let overlap = min(cellUpper, upper) - max(cellLower, lower)
         return overlap.isFinite && overlap > 0 ? overlap : 0
@@ -599,13 +682,19 @@ public struct Matcher: Sendable {
         bands: [FrequencyBand],
         bins: [Int],
         frequencies: [Double],
-        deltas: [Double],
+        cellEdges: [Double]?,
+        channelDeltas: [[Double]],
         totalEnergy: Double,
-        globalGain: Double,
+        gainAnchor: Double,
+        relativeGlobalGain: Double,
         commonMinimum: Double,
         commonMaximum: Double
     ) -> [MatchBandEvidence] {
-        bands.map { band in
+        // Precomputed overlaps keep the same cell-integration semantics while
+        // visiting only bins that belong to a band. Read the already-decoded
+        // PSD arrays directly below; do not create a second frames × bins
+        // cache just for evidence.
+        return bands.map { band in
             let lower = max(band.lowerHz, commonMinimum)
             let upper = min(band.upperHz, commonMaximum)
             guard lower < upper else {
@@ -621,21 +710,37 @@ public struct Matcher: Sendable {
                 )
             }
 
+            let overlappingBins = bins.enumerated().compactMap { localIndex, index -> (localIndex: Int, index: Int, overlap: Double)? in
+                let overlap = cellOverlapWidth(
+                    frequencies: frequencies,
+                    index: index,
+                    lower: lower,
+                    upper: upper,
+                    cellEdges: cellEdges
+                )
+                return overlap > 0 ? (localIndex, index, overlap) : nil
+            }
+
             var bandEnergy = 0.0
             var weightedDelta = 0.0
             var weightedVariance = 0.0
             var peakEnergy = 0.0
             var peakTime: Double?
             for frame in features.frames {
-                let powers = averagedPower(frame: frame, channelCount: features.channelCount, indices: bins)
                 var frameBandEnergy = 0.0
-                for (localIndex, index) in bins.enumerated() {
-                    let overlap = cellOverlapWidth(frequencies: frequencies, index: index, lower: lower, upper: upper)
-                    guard overlap > 0 else { continue }
-                    let energy = max(0, powers[localIndex]) * overlap
-                    frameBandEnergy += energy
-                    bandEnergy += energy
-                    weightedDelta += energy * deltas[localIndex]
+                let channelCount = min(features.channelCount, frame.powerSpectralDensityByChannel.count)
+                for channelIndex in 0..<channelCount {
+                    let powers = frame.powerSpectralDensityByChannel[channelIndex]
+                    guard channelIndex < channelDeltas.count else { continue }
+                    let deltas = channelDeltas[channelIndex]
+                    for (localIndex, index, overlap) in overlappingBins {
+                        guard index < powers.count else { continue }
+                        let value = powers[index]
+                        let energy = (value.isFinite && value >= 0 ? value : 0) * overlap
+                        frameBandEnergy += energy
+                        bandEnergy += energy
+                        weightedDelta += energy * (deltas[localIndex] - gainAnchor)
+                    }
                 }
                 if frameBandEnergy > peakEnergy {
                     peakEnergy = frameBandEnergy
@@ -655,21 +760,36 @@ public struct Matcher: Sendable {
                     state: .noAudioContent
                 )
             }
-            let meanDelta = weightedDelta / bandEnergy - globalGain
+            let meanDelta = weightedDelta / bandEnergy - relativeGlobalGain
             for frame in features.frames {
-                let powers = averagedPower(frame: frame, channelCount: features.channelCount, indices: bins)
-                for (localIndex, index) in bins.enumerated() {
-                    let overlap = cellOverlapWidth(frequencies: frequencies, index: index, lower: lower, upper: upper)
-                    guard overlap > 0 else { continue }
-                    let energy = max(0, powers[localIndex]) * overlap
-                    weightedVariance += energy * pow(deltas[localIndex] - globalGain, 2)
+                let channelCount = min(features.channelCount, frame.powerSpectralDensityByChannel.count)
+                for channelIndex in 0..<channelCount {
+                    let powers = frame.powerSpectralDensityByChannel[channelIndex]
+                    guard channelIndex < channelDeltas.count else { continue }
+                    let deltas = channelDeltas[channelIndex]
+                    for (localIndex, index, overlap) in overlappingBins {
+                        guard index < powers.count else { continue }
+                        let value = powers[index]
+                        let energy = (value.isFinite && value >= 0 ? value : 0) * overlap
+                        weightedVariance += energy * pow((deltas[localIndex] - gainAnchor) - relativeGlobalGain, 2)
+                    }
                 }
             }
             let isPartial = lower > band.lowerHz || upper < band.upperHz
-            let frequencyResolution = features.sampleRate / Double(features.parameters.frameLength)
-            let isResolutionLimited = frequencyResolution.isFinite
-                && frequencyResolution > 0
-                && (upper - lower) < frequencyResolution
+            // Preserve the native nil-edges diagnostic exactly. Compact input
+            // carries its real cell widths, which replace the uniform FFT
+            // spacing estimate here.
+            let resolutionWidth: Double
+            if cellEdges == nil {
+                resolutionWidth = features.sampleRate / Double(features.parameters.frameLength)
+            } else {
+                resolutionWidth = overlappingBins
+                    .map { cellWidth(frequencies: frequencies, index: $0.index, cellEdges: cellEdges) }
+                    .max() ?? 0
+            }
+            let isResolutionLimited = resolutionWidth.isFinite
+                && resolutionWidth > 0
+                && (upper - lower) < resolutionWidth
             return MatchBandEvidence(
                 band: band,
                 actualLowerHz: lower,

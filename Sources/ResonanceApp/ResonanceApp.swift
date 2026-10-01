@@ -260,7 +260,7 @@ struct MainView: View {
                 Text("尚未选择个人偏好参考；可在声学资料库勾选“我喜欢的声音”。")
                     .font(Typography.secondary).foregroundStyle(Palette.muted)
             } else {
-                Text("个人参考：\(model.preferredReferences.map { $0.name }.joined(separator: "、")) · 偏好接近度按整体 dB，低值更接近。")
+                Text("个人参考：\(model.preferredReferences.map { $0.name }.joined(separator: "、")) · 低 dB 更接近参考音色，不代表喜欢概率。")
                     .font(Typography.secondary).foregroundStyle(Palette.muted)
             }
             HStack {
@@ -283,7 +283,7 @@ struct MainView: View {
         VStack(alignment: .leading, spacing: 8) {
             SectionCaption(title: model.mode == .song ? "耳机与这首歌" : "候选歌曲", trailing: "\(model.results.count) RESULTS")
             if model.mode == .headphone && model.sort == .character {
-                Text("C 只表示谱形变化更明显，不代表更好听；偏好接近度请看低 dB。")
+                Text("C 只表示谱形变化更明显，不代表更好听；参考接近度请看低 dB。")
                     .font(Typography.secondary).foregroundStyle(Palette.muted)
             }
             if Set(model.results.filter(\.eligible).map(\.comparisonGroup)).count > 1 {
@@ -322,7 +322,7 @@ struct MainView: View {
     private func personalSummary(_ personal: PersonalMatchResult, bestReferenceName: String?) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 5) {
-                Text("偏好接近度").foregroundStyle(Palette.muted)
+                Text("参考接近度").foregroundStyle(Palette.muted)
                 Text("低 dB 更接近").foregroundStyle(Palette.muted.opacity(0.8))
             }
             if let name = bestReferenceName ?? personal.matches.first(where: { $0.referenceID == personal.bestReferenceID })?.referenceName {
@@ -379,6 +379,14 @@ struct MainView: View {
             }
             Text("低 dB 表示更接近该参考；P90 按压缩帧能量加权。最大差异位置是录音内时间，不等于最易听见的差异。")
                 .font(Typography.secondary).foregroundStyle(Palette.muted)
+            if !personal.sensitivityDiagnostics.isEmpty && personal.bestReferenceID != nil {
+                let referenceChoices = Set(personal.sensitivityDiagnostics.compactMap(\.bestReferenceID))
+                let incomplete = personal.sensitivityDiagnostics.contains { $0.bestReferenceID == nil }
+                Text("权重检查（\(personal.sensitivityDiagnostics.count) 种情景）：\(incomplete ? "部分情景没有可比较结果" : (referenceChoices.count > 1 ? "最接近的参考发生变化" : "最接近的参考保持一致"))。")
+                    .font(Typography.secondary).foregroundStyle(incomplete || referenceChoices.count > 1 ? .orange : Palette.muted)
+                Text("下方范围只表示这些权重假设带来的变化，不包含佩戴、测量夹具或个人听感的不确定性；默认排序保持原计算方式。")
+                    .font(Typography.secondary).foregroundStyle(Palette.muted)
+            }
             ForEach(personal.matches) { match in
                 VStack(alignment: .leading, spacing: 6) {
                     VStack(alignment: .leading, spacing: 8) {
@@ -393,6 +401,10 @@ struct MainView: View {
                         personalMetric("整体", match.overallDeviationDB)
                         personalMetric("10–20k", match.highFrequencyDeviationDB)
                         personalMetric("P90", match.frameErrorP90DB)
+                    }
+                    if let range = sensitivityRange(personal, referenceID: match.referenceID) {
+                        Text("权重检查范围：\(range) dB")
+                            .font(Typography.secondary).foregroundStyle(Palette.muted)
                     }
                     if let time = match.worstFrameStartTimeSeconds {
                         Text("录音内差异最大位置约 \(durationLabel(time))\(match.worstFrameErrorDB.map { " · \(String(format: "%.1f dB", $0))" } ?? "")")
@@ -413,6 +425,14 @@ struct MainView: View {
                 }.padding(10).background(Palette.base.opacity(0.55), in: RoundedRectangle(cornerRadius: 7))
             }
         }
+    }
+
+    private func sensitivityRange(_ personal: PersonalMatchResult, referenceID: UUID) -> String? {
+        let values = personal.sensitivityDiagnostics.compactMap { scenario in
+            scenario.references.first { $0.referenceID == referenceID }?.overallDeviationDB
+        }.filter(\.isFinite)
+        guard let low = values.min(), let high = values.max() else { return nil }
+        return String(format: "%.2f–%.2f", low, high)
     }
 
     private func personalMetric(_ label: String, _ value: Double?) -> some View {

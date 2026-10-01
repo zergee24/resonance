@@ -7,26 +7,24 @@ cd "$root_dir"
 
 verification_dir="$root_dir/test-output/verification"
 mkdir -p "$verification_dir"
-report="$verification_dir/core-harness.md"
-temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/resonance-core-verify.XXXXXX")"
+temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/resonance-compact-spectrum.XXXXXX")"
 trap 'rm -rf "$temporary_dir"' EXIT
 
-binary="$temporary_dir/verify-core"
-swiftc -O \
+binary="$temporary_dir/verify-compact-spectrum"
+swiftc -O -swift-version 5 -parse-as-library \
   -framework Accelerate \
   -framework AVFoundation \
   Sources/ResonanceCore/Models.swift \
   Sources/ResonanceCore/CompactSpectrum.swift \
   Sources/ResonanceCore/SpectrumAnalyzer.swift \
-  Sources/ResonanceCore/Matcher.swift \
-  Sources/ResonanceCore/CurveImporter.swift \
-  scripts/verify-core.swift \
+  scripts/verify-compact-spectrum.swift \
   -o "$binary"
 
+report="$verification_dir/compact-spectrum.md"
 {
-  printf '%s\n' '# ResonanceCore verification'
-  printf '%s\n' '' '- Command: `scripts/verify-core.sh`' "- Swift: \`$(swift --version | head -1)\`" ''
-  "$binary" 2>&1
+  printf '%s\n' '# Compact spectrum verification'
+  printf '%s\n' '' '- Command: `scripts/verify-compact-spectrum.sh`' "- Swift: \`$(swift --version | head -1)\`" ''
+  "$binary"
 } | tee "$report"
 
 printf '%s\n' "Report: $report"

@@ -27,6 +27,7 @@ swiftc -O -swift-version 5 -parse-as-library \
   -framework Accelerate \
   -framework AVFoundation \
   "$root_dir/Sources/ResonanceCore/Models.swift" \
+  "$root_dir/Sources/ResonanceCore/CompactSpectrum.swift" \
   "$root_dir/Sources/ResonanceCore/SpectrumAnalyzer.swift" \
   "$root_dir/Sources/ResonanceCore/Matcher.swift" \
   "$root_dir/Sources/ResonanceCore/CurveImporter.swift" \

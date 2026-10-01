@@ -56,6 +56,9 @@ final class AppModel: ObservableObject {
     var database: LocalStore?
     var matchTask: Task<Void, Never>?
     var analysisTask: Task<Void, Never>?
+    /// At most one detached raw-audio cache plan may read feature artifacts.
+    /// A stale plan is discarded by the MainActor snapshot check.
+    var rawAudioCacheTask: Task<Void, Never>?
     var analysisRevision: UUID?
     /// Deduplicate pending/running segment revisions; completed requests
     /// release their key so failed analysis can be retried.

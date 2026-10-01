@@ -15,3 +15,7 @@ test-output/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Local plugin workspace state
+.v2c/
+.video_agent/

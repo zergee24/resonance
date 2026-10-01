@@ -27,6 +27,112 @@ final class MatcherTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(result.c), 0, accuracy: 1e-12)
     }
 
+    func testOpposingStereoCurvesAreNotAveragedBeforeClassicMetrics() throws {
+        let reference = try makeCurve(name: "stereo reference", values: [0, 0, 0], isReference: true)
+        let left = try makeCurve(name: "left +6/0/-6", values: [6, 0, -6])
+        let right = try makeCurve(name: "right -6/0/+6", values: [-6, 0, 6])
+        let features = try makeStereoFeatures(leftPSD: [1, 1, 1], rightPSD: [0, 0, 0])
+
+        let result = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "stereo", owned: true, curve: left, rightCurve: right, referenceID: reference.id),
+            reference: reference
+        )
+
+        XCTAssertGreaterThan(try XCTUnwrap(result.c), 1e-6)
+        XCTAssertGreaterThan(try XCTUnwrap(result.d), 1e-6)
+        XCTAssertGreaterThan(try XCTUnwrap(result.dHigh), 1e-6)
+    }
+
+    func testIdenticalStereoCurvesPreserveSingleCurveResult() throws {
+        let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
+        let curve = try makeCurve(name: "same left and right", values: [3, -1, 4])
+        let features = try makeStereoFeatures(leftPSD: [1, 0.5, 2], rightPSD: [0.25, 2, 0.75])
+
+        let fallback = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "fallback", owned: true, curve: curve, referenceID: reference.id),
+            reference: reference
+        )
+        let stereo = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "identical stereo", owned: true, curve: curve, rightCurve: curve, referenceID: reference.id),
+            reference: reference
+        )
+
+        XCTAssertEqual(try XCTUnwrap(stereo.c), try XCTUnwrap(fallback.c), accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(stereo.d), try XCTUnwrap(fallback.d), accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(stereo.dHigh), try XCTUnwrap(fallback.dHigh), accuracy: 1e-12)
+    }
+
+    func testSingleChannelDoesNotUseUnheardRightCurve() throws {
+        let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
+        let left = try makeCurve(name: "left", values: [3, -1, 4])
+        let unrelatedRight = try makeCurve(name: "unrelated right", values: [100, 100, 100])
+        let features = try makeMonoFeatures(psd: [1, 0.5, 2])
+
+        let fallback = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "left only", owned: true, curve: left, referenceID: reference.id),
+            reference: reference
+        )
+        let withUnheardRight = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "left plus unheard right", owned: true, curve: left, rightCurve: unrelatedRight, referenceID: reference.id),
+            reference: reference
+        )
+
+        XCTAssertEqual(try XCTUnwrap(withUnheardRight.c), try XCTUnwrap(fallback.c), accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(withUnheardRight.d), try XCTUnwrap(fallback.d), accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(withUnheardRight.dHigh), try XCTUnwrap(fallback.dHigh), accuracy: 1e-12)
+    }
+
+    func testStereoAndEQSupportUseTheActualCommonFrequencyRange() throws {
+        let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
+        let left = try makeCurve(name: "left", values: [1, 2, 3])
+        let right = try makeCurve(
+            name: "right measured from 1 kHz",
+            values: [1, 2, 3],
+            validMinHz: 1_000
+        )
+        let eq = try makeCurve(
+            name: "EQ measured from 1 kHz",
+            values: [0, 0, 0],
+            validMinHz: 1_000
+        )
+        let result = Matcher().match(
+            features: try makeStereoFeatures(leftPSD: [1, 1, 1], rightPSD: [1, 1, 1]),
+            headphone: Headphone(name: "limited support", owned: true, curve: left, rightCurve: right, referenceID: reference.id, eqCurve: eq),
+            reference: reference
+        )
+
+        XCTAssertTrue(result.isEvaluable)
+        XCTAssertEqual(result.evaluatedMinHz, 1_000, accuracy: 1e-12)
+    }
+
+    func testSwappingStereoChannelsAndCurvesPreservesClassicMetrics() throws {
+        let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
+        let left = try makeCurve(name: "left", values: [6, 0, -2])
+        let right = try makeCurve(name: "right", values: [-3, 2, 5])
+        let features = try makeStereoFeatures(leftPSD: [1, 0.5, 2], rightPSD: [0.25, 2, 0.75])
+        let swappedFeatures = try makeStereoFeatures(leftPSD: [0.25, 2, 0.75], rightPSD: [1, 0.5, 2])
+
+        let result = Matcher().match(
+            features: features,
+            headphone: Headphone(name: "stereo", owned: true, curve: left, rightCurve: right, referenceID: reference.id),
+            reference: reference
+        )
+        let swapped = Matcher().match(
+            features: swappedFeatures,
+            headphone: Headphone(name: "swapped stereo", owned: true, curve: right, rightCurve: left, referenceID: reference.id),
+            reference: reference
+        )
+
+        XCTAssertEqual(try XCTUnwrap(swapped.c), try XCTUnwrap(result.c), accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(swapped.d), try XCTUnwrap(result.d), accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(swapped.dHigh), try XCTUnwrap(result.dHigh), accuracy: 1e-12)
+    }
+
     func testCurveLevelOffsetsDoNotChangeNormalizedMetricsOrRelativeBandGain() throws {
         let reference = try makeCurve(name: "reference", values: [0, 0, 0], isReference: true)
         let headphoneCurve = try makeCurve(name: "headphone", values: [3, -1, 4])
@@ -189,13 +295,17 @@ final class MatcherTests: XCTestCase {
         name: String,
         frequencies: [Double] = [20, 1_000, 20_000],
         values: [Double],
-        isReference: Bool = false
+        isReference: Bool = false,
+        validMinHz: Double? = nil,
+        validMaxHz: Double? = nil
     ) throws -> Curve {
         try Curve(
             name: name,
             points: zip(frequencies, values).map { try! CurvePoint(frequencyHz: $0.0, decibels: $0.1) },
             source: "test",
             measurementSystem: "synthetic",
+            validMinHz: validMinHz,
+            validMaxHz: validMaxHz,
             isReference: isReference
         )
     }
@@ -230,6 +340,40 @@ final class MatcherTests: XCTestCase {
             validMinHz: frequencies.first!,
             validMaxHz: frequencies.last!,
             format: AudioFormatMetadata(sampleRate: 48_000, channelCount: 2),
+            parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 0.02)
+        )
+    }
+
+    private func makeMonoFeatures(psd: [Double]) throws -> SpectrumFeatures {
+        try makeChannelFeatures(channels: [psd])
+    }
+
+    private func makeStereoFeatures(leftPSD: [Double], rightPSD: [Double]) throws -> SpectrumFeatures {
+        try makeChannelFeatures(channels: [leftPSD, rightPSD])
+    }
+
+    private func makeChannelFeatures(channels: [[Double]]) throws -> SpectrumFeatures {
+        let frequencies = [20.0, 1_000, 20_000]
+        let coverage = try Coverage(
+            kind: .complete,
+            intervals: [TimeRange(startSeconds: 0, endSeconds: 1)],
+            identityConfirmed: true
+        )
+        return SpectrumFeatures(
+            sampleRate: 48_000,
+            channelCount: channels.count,
+            frequencyBinsHz: frequencies,
+            frames: [SpectrumFrame(
+                startTimeSeconds: 0,
+                sampleCount: 1_024,
+                powerSpectralDensityByChannel: channels
+            )],
+            durationSeconds: 1,
+            coverage: coverage,
+            validMinHz: frequencies.first!,
+            validMaxHz: frequencies.last!,
+            frequencyValidity: .measuredContent,
+            format: AudioFormatMetadata(sampleRate: 48_000, channelCount: channels.count),
             parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 0.02)
         )
     }

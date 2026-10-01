@@ -176,7 +176,7 @@ struct BandPresentation: Identifiable {
 }
 
 enum SongSort: String, CaseIterable, Identifiable {
-    case personal = "偏好接近度"
+    case personal = "参考接近度"
     case character = "谱形变化"
     case balanced = "参考偏差 D"
     case high = "10–20k 偏差"

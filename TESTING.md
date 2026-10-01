@@ -1,6 +1,28 @@
-# 本机验证记录 · 0.3.3
+# 本机验证记录 · 0.3.4
 
-日期：2026-09-25—2026-09-28。macOS 26.6.2，Apple Silicon，Swift 6.3.3，部署目标 macOS 14.2。各版本证据分列如下。
+日期：2026-09-25—2026-09-30。macOS 26.6.2，Apple Silicon，Swift 6.3.3，部署目标 macOS 14.2。各版本证据分列如下。
+
+## 0.3.4 精简频谱、原始音频缓存与正式采用（2026-09-30）
+
+用户明确授权更新主 App，并授权在实测验证通过后处理历史数据。已使用既有构建脚本更新本地 `dist/共鸣.app` 至 **0.3.4 build 15**，Debug/Release 构建及 App/helper 签名校验通过；可执行文件 SHA-256：`97248e47bc0f1a9fc211ef505f97474156959aec686a9eabbd19774ffecc7cf1`。未发布 DMG、提交或推送。此次同时采用已验证的短段恢复、串行匹配及内存回收、参考权重敏感性诊断、compact 频谱和 2 GB 原始音频缓存策略。
+
+历史资料采用只读原库、另建转换副本的流程；863 条 track 文档中，530 条已有频谱的记录完成转换。714 份 leaf 和 173 份合并 manifest 均回读验证，最大 PSD 编码误差约 0.005 dB，帧数、时间、声道、覆盖及参数保留。原批报告如实保留一条候选复制记录的 aggregate ID 别名失败；仅在私有来源 manifest、准确歌曲 ID、候选导入凭证、segment owner/hash/时长与完整逐帧 parity 一致后，单独修复转换副本，未放宽公共转换器。全部 874 文档身份与 track 非路径元数据在切换前核对一致，11 个歌单、导出、耳机和曲线文档在采用后仍逐字节未变。
+
+正式 App 启动后恢复了一条含短段和有效长段的待分析记录，已分析记录增至 531；短段保留等待后续录音，不伪造一帧或完整覆盖。UI 使用新格式完成 30 项候选匹配，显示共同范围、partial、5 种权重情景和 compact 近似说明。原始音频回收后再次启动，用一条原 PCM 已不存在的 24:58 历史录音成功显示平均功率谱和实际匹配结果。随后从保护的 219.643 秒断点恢复网易云，UI 确认已有足够覆盖并复用保存结果，没有重新录制。
+
+实际占用（十进制 GB，2026-09-30 18:04）：
+
+| 范围 | 处理前 | 处理后 |
+| --- | ---: | ---: |
+| 主目录原始录音 | 44.555 GB / 771 文件 | 1.946 GB / 87 文件 |
+| 活动频谱 | 238.616 GB / 875 native 文件 | 3.656 GB / 889 compact 文件与引用 |
+| 主录音与活动频谱合计 | 283.171 GB | **5.602 GB** |
+
+自动缓存实际删除 684 个已验证 CAF、42.609 GB；显式退役 875 个旧 native 频谱、238.616 GB。保留下来的原始音频大小与修改时间未变；raw、未完成和未知录音受保护。整个私有资料目录约 **9.406 GB**，含旧批量匹配产物、报告及备份；其中一份 0.337 GB 历史 aggregate 仍被旧导出文档引用，保留而未删。频谱随新资料增长，2 GB 是录音缓存目标，不是整个资料库的硬上限。
+
+旧 native 全库转换由单进程串行执行，`/usr/bin/time -l` 的实际最大 RSS 为 **4,694,523,904 字节**；5 秒抽样只观察到约 3.57 GB，不拿抽样值替代峰值。新版清理后恢复播放时当前 RSS 实测约 **253 MB**，仅为该时刻占用，不是运行峰值或上限。新的分析直接逐帧生成 compact PSD；匹配仍物化整曲 compact frames，超长录音内存仍随时长增长。该时刻界面 CPU 仍偏高（约 94%），原有界面资源问题未宣称解决。
+
+最终源码对应检查包括 `verify-core`、`verify-personal`、compact codec/spectrum/matching/library、streaming analysis、recording merge/analysis、raw audio cache，以及 Debug/Release 构建。缓存测试覆盖共享引用、pending/短段/失败、当前采集、token/文件指纹变化和 symlink 越界保护；先前 fixture/编译错误修正后相应检查已重新通过。XCTest 未运行；本次没有主动重录或另起长时间真实采集测试。最终源码校验与脚本结果在忽略目录 `test-output/verification/compact-check-results.json`，私有迁移、单条修复、切换、回收和采用凭证在 `共鸣资料/compact-migration-20260930`。新表示并非无损，高 Q 峰、接近的排序和最差帧位置仍可能变化，见下文真实与压力样本结果。
 
 ## 0.3.3 分析恢复与同曲续录
 
@@ -14,7 +36,8 @@
 - `verify-recording-continuation.sh` 与 `verify-recording-merge.sh` 通过。验证包含旧库读取、暂停后系统 UUID 改变仍复用同曲、专辑/时长/歌曲 ID 冲突不合并、覆盖区间并集、已采范围停录、单段重叠窗口完整保留、跨段偏移、重复区间，以及缺少媒体起点或频率网格不同的明确失败。
 - Release **0.3.3 build 14** 构建与 App/helper 签名检查通过；可执行文件 SHA-256：`aa9b8a3cbcc0f76c0ca428dfc62e3a29c66d1f730f809b1bce6cb9fe580a7f25`。正式应用成功认领两份已验证产物并继续处理积压；首轮已分析录音由 47 条增至 64 条，正常退出并重启后继续增加，最终 74 条有音频的记录均已有频谱，27 条积压全部补齐。原有 275 条源歌单记录与所有本地歌单文档逐项对比备份未变。
 - 真机发现网易云的系统播放 UUID 会随暂停、续播和定位变化，因此最终版以精确网易云 ID 优先；无 ID 时核对来源 Bundle、完整标题、艺人、专辑和时长，保留版本信息，冲突时不自动合并。临时 UUID 仅作为观测元数据，不冒充网易云 ID。修复后同曲续播没有再新增录音候选，原 CAF 与频谱路径保持不变。
-- **采集恢复尚未通过**：先行 build 13 和最终 build 14 首次尝试都遇到旧签名 AudioCapture 授权不匹配。单纯关闭再打开开关未刷新代码要求；针对共鸣重置 AudioCapture 并在系统设置按绝对路径重新添加最终 App 后，tccd 对最终构建确认 `authValue=2`，但录音仍只有 4096 字节 CAF 头。先行与最终构建的进程采样均停在 `AudioDeviceStart → HALC_ProxyIOContext::_StartIO`；需要再次恢复系统音频服务后，用同一最终二进制补做真实续录验收。无密码的管理员命令返回 `sudo: a password is required`，未把此情况写作采集成功。
+- **服务重启前的阻塞**：先行 build 13 和最终 build 14 首次尝试都遇到旧签名 AudioCapture 授权不匹配。单纯关闭再打开开关未刷新代码要求；针对共鸣重置 AudioCapture 并在系统设置按绝对路径重新添加最终 App 后，tccd 对最终构建确认 `authValue=2`，但录音仍只有 4096 字节 CAF 头。先行与最终构建的进程采样均停在 `AudioDeviceStart → HALC_ProxyIOContext::_StartIO`。无密码的管理员命令返回 `sudo: a password is required`，当时未把此情况写作采集成功。
+- **2026-09-28 14:37 真实续录恢复**：用户重启系统音频服务后，使用上列同一 build 14 二进制重新启动应用。当前歌在原记录追加 15.530667 秒尾段，48 kHz 双声道、零丢帧，PCM 全部有限且非零；原 278.368 秒 CAF 的 SHA-256 不变。正式应用保存了两个分段特征及 combined 频谱，累计有效时长 293.898667 秒，随后自然切到下一首且 CAF 持续增长。启动边界仍有约 3.28 秒缺口，已记入私有进度，不宣称无缺口整曲覆盖。原 275 条源歌单的顺序、歌曲 ID、标题及艺人逐项对比备份未变；录音持有防系统闲置睡眠 assertion。此轮未重复锁屏测试，旧版锁屏证据见下文。新进程合并后的 physical footprint 实测约 290 MB，运行峰值 3.5 GB；界面 CPU 偏高仍待处理。
 
 ## 0.3.2 后台采集与锁屏验证进度
 
@@ -195,3 +218,95 @@
 - 0.2.1 恢复网易云写入功能，本地 JSON 导出保留；实际账号创建成功仍需单独验证。
 
 应用使用本机临时签名，未公证。原始用户资料和历史导出 journal 保留在本地，本轮未清除。
+
+
+## 2026-09-29 声学研究精进：源码验证，未更新主 App
+
+基线为 `b87a597d6dd4b8baefa700bc5555d82172792e3a`，验证对象是本轮未提交工作树；精确源码 SHA-256 记录在本机 `test-output/verification/refinement-source-version.json`。两个核心文件：
+
+- Matcher：`f9bd873ea20fd7e1845112d03d89da64587cb64236bcad781fba168a6c41175c`。模型版本 `3-cd-c-high-channel-linear`。
+- PersonalMatcher：`17915fceac0aac231a185d12b961dffcaf4dad644a09b4085d519dca8a1908b2`。模型版本 `personal-v2-independent-spectral-temporal-weighting`。
+
+验证按低优先级、小输入执行，没有运行正式 App、音频播放或真实设备采集测试：
+
+- `nice -n 15 zsh scripts/verify-core.sh` 全部通过。覆盖左右反向曲线不抵消、同曲线兼容、单边音频、声道交换、共同范围、±120 dB / +1e6 dB 整体偏移不变量、频率单元积分、扩展频段及完整 60 秒合成时间轴。最后一次小型合成基准为 120 帧 × 1025 bins，11.22 ms；不是曲库性能结论。
+- `nice -n 15 zsh scripts/verify-personal.sh --live-feature <已有短频谱> --output test-output/verification/personal-refinement-live.json` 通过 17 项断言，覆盖独立参数、情景与单独计算一致、静音、能量/曲线整体增益不变性、扩展频段隔离和低能量窄带案例。情景说明使用对应参数，不沿用基准指数。
+- 真实只读样本为 41.419 秒、967 帧、48 kHz 双声道的已保存频谱；未播放音频。两条参考的默认整体、高频、P90、最大偏差及其时间共 10 项值，与此前批量结果逐项完全相同。此结论限于该样本及本轮合成不变量，未重算完整曲库。
+- 最后一次真实样本：特征解码 0.128 秒；个人匹配含五种权重诊断 0.100 秒；经典匹配 0.178 秒。这些是单样本观测，不作为全曲库耗时或内存上界。
+- 该样本在单独改变谱指数至 0.2 时，最佳参考从 Alter Ego 翻转为 HE1；这验证了诊断可揭示参数依赖，不等于已验证听感改善。
+- `nice -n 15 swift build -c debug --jobs 1` 通过；仅构建 `.build` 产物。当前 Command Line Tools 缺少 XCTest 模块，XCTest 套件未运行；原生 Swift probes 实际执行通过。界面文案与详情通过编译，未启动主 App 做视觉验收。
+
+主 App 的 SHA-256 复核仍为 `aa9b8a3cbcc0f76c0ca428dfc62e3a29c66d1f730f809b1bce6cb9fe580a7f25`；未构建 dist、改签名、重启、操作播放器、写库或改变采集。用户继续使用原 App 采集；本轮源码尚未部署。默认个人评分仍用 0.3/0.3，新增五情景会增加计算工作，因此不得沿用旧版本性能报告。
+
+研究与外推边界见 [2006–2026 研究记录](docs/research/headphone-song-matching-2006-2026.md)。实际喜欢程度、流派适合度和测量不确定性仍需受控试听与相应测量数据，未由本轮测试验证。
+
+## 2026-09-30 短录音段阻断后续分析：源码修复，未更新主 App
+
+只读现场确认：一条失败录音含 48 kHz 的 7,168 帧短首段（0.149333 秒）和 297.525333 秒有效长段。默认分析窗实际为 8,192 帧（0.170667 秒）；旧队列在首段抛出 `Audio is shorter than one analysis frame` 后中止整条请求，后续长段未得到分析。两个原始 CAF 均有真实 PCM；该错误不是文件只有头部的证据。
+
+修复使用与 FFT 相同配置计算的文件元数据预检。短段保留 PCM、录音元数据和已有音频摘要，标记等待，不补零、不缩小频谱窗；队列继续分析有效段。合并频谱只包含已分析段的媒体区间，存在短段时保持 partial。全短段不会生成空频谱或反复恢复入队；后续追加有效段可恢复。正常单段直接复用 segment artifact，避免额外复制 combined 文件。空容器及损坏容器仍报告实际错误。
+
+验证基线为 `b87a597d6dd4b8baefa700bc5555d82172792e3a` 的未提交工作树；本机完整文件版本和日志在 `test-output/verification/short-segment-source-version.json` 及同目录保存。核心修改 SHA-256：
+
+- `RecordingAnalysis.swift`：`7a42a30c72864f4dbf7333334384c5a42aee9b07c667a2ab72039cb95736886b`。
+- `SpectrumAnalyzer.swift`：`ddebfc40431b4005282b287a2fd14a5ccd152e851c8311e7f0d1fc578218f9b4`。
+
+低优先级验证全部通过：
+
+- `nice -n 15 zsh scripts/verify-recording-analysis.sh`：编译生产 `RecordingAnalysis`、`LocalStore`、`RecordingContinuation`，使用仅承载状态的 AppModel 测试壳和临时 SQLite；未实例化正式 AppModel、WebView、播放器或采集驱动。覆盖短首段后长段实际落盘、媒体偏移和 partial、原 PCM/摘要保留、全短段重载后不重试、追加有效尾段恢复、丢失 aggregate 后复用已有 segment 频谱、单段不重复生成 combined、legacy 短段以及空/损坏文件失败。
+- `nice -n 15 zsh scripts/verify-recording-merge.sh`：覆盖 8,191/8,192/8,193 帧边界，读取原始 PCM 不改写，保留原有 STFT 重叠窗、媒体偏移、跨段去重和未知起点/频率网格拒绝。该探针验证生产预检与合并函数；队列恢复由上一个探针验证。
+- `nice -n 15 swift build -c debug --jobs 1`：通过，仅生成 `.build` 产物。`git diff --check` 通过。本轮未执行 XCTest 或真机采集测试。
+
+正式 `dist/共鸣.app` SHA-256 仍为 `aa9b8a3cbcc0f76c0ca428dfc62e3a29c66d1f730f809b1bce6cb9fe580a7f25`；未更新、改签名、启动或重启它，也未控制播放/录音或写真实数据库。受影响的实际数据库记录仍保留旧错误，两个原始 CAF 的大小和修改时间未变；未来采用修复版本后才能验证该真实记录恢复，不把临时夹具通过描述成运行现场已修复。
+
+## 2026-09-30 算法与短片段恢复联合修复：源码验证，未部署
+
+复核补修了个人匹配的单声道频段错误：计算只使用左曲线时，原先仍将未参与计算的右曲线纳入共同频段，导致有效范围被截断或错误返回不可匹配。现在仅对具有右声道 PSD 的录音使用右曲线限制；双声道仍按左右曲线共同有效范围计算。默认权重 0.3/0.3 和排序逻辑未改。此前的左右声道独立计算、谱内与跨帧独立权重、参数敏感性诊断仍包含在同一未部署工作树中。
+
+验证对应基线 `b87a597d6dd4b8baefa700bc5555d82172792e3a` 的工作树；当前 `PersonalMatcher.swift` SHA-256 为 `7dcfd32e7326853eb8480e598dfbbf811d99e0bb4c3d96986f4cd0eee34471c2`。完整源码与探针哈希、日志位置保存在本机 `test-output/verification/joint-algorithm-source-version.json`。
+
+- `nice -n 15 zsh scripts/verify-core.sh`：经典算法回归通过，包含左右曲线不相互抵消、同曲线兼容、整体电平不变性及频段积分边界。
+- `nice -n 15 zsh scripts/verify-personal.sh --output test-output/verification/joint-algorithm-personal.json`：16 项探针检查通过；新增单声道忽略窄范围/无交集右曲线，以及双声道仍遵守右曲线范围的验证。
+- `nice -n 15 zsh scripts/verify-recording-analysis.sh`：实际生产队列、临时 SQLite 与合成 CAF 联合验证通过。短首段后的有效段进入两种匹配算法，分数与仅使用有效段时一致，参考选择不变，结果保留 partial；未把等待的短段计为完整覆盖。原有等待、追加恢复、artifact 复用和损坏文件错误检查也通过。
+- `nice -n 15 swift build -c debug --jobs 1`、`git diff --check` 通过。新增 XCTest 源码语法解析通过，但当前工具链缺少 XCTest，未执行 XCTest 套件；实际执行证据来自上述原生 Swift 探针。
+
+只生成 `.build` 和临时测试产物，未操作正式 App、播放器、采集或真实数据库。正式 App 二进制哈希复核与上节一致，修复尚未用于现场采集；本轮验证算法行为与恢复链路，不代表已验证真实听感偏好。
+
+## 2026-09-30 内存生命周期与磁盘占用核验：源码修复，未部署
+
+只读统计（15:09 起，十进制 GB）：活动 `Audio` 771 个 CAF，共 44.55 GB；`Features` 875 个文件，共 238.62 GB，其中分段频谱 177.72 GB、163 个 combined 频谱 60.90 GB。活动音频与频谱合计 283.17 GB，卷剩余约 305.51 GB。Application Support 下的 Audio/Features 是符号链接，未重复计数。另有约 3.65 GB 私有匹配产物，以及约 3.58 GB 迁移前音频/频谱副本。所有 875 个活动频谱文件均仍被 track 文档引用，未按“垃圾文件”删除；细分证据保存在忽略目录 `test-output/verification/storage-usage-20260930.json`。
+
+现有默认分析保存 75% 重叠窗、每个声道的完整 Float64 PSD。以 48 kHz 双声道 Float32 PCM 为例，PSD 原始数值量约为 PCM 的四倍；另存 combined 又增加磁盘副本。本轮未减少频谱精度、改存储格式、迁移或删除现有文件，磁盘占用没有因内存修复而减少。
+
+本轮修复三个明确的额外内存来源：
+
+- `LocalStore` 在每次 artifact 读写和每个摘要读取块结束时排空 autorelease pool，及时释放 Foundation 编码、压缩、解压和文件读取临时对象；保留原有格式、原子写入与错误传播。
+- `MatchingService.recompute` 取消旧任务后等待旧 worker 返回，再启动新 worker；频谱读取后及绘图逐帧检查取消。连续切换范围时不再让多轮匹配同时解码大频谱。同步解压/匹配中的取消仍需等当前调用结束。
+- `SpectrumAnalyzer` 文件路径改为有限 PCM 解码缓冲和滑动窗口，去掉整曲 PCM 额外驻留；保留 FFT 参数、原始采样率/声道、完整帧时间轴、Float64 PSD、尾段非有限样本检查、覆盖字段和原 EOF 语义。
+
+低优先级、独立新进程测量，全部使用合成数据和临时文件：
+
+| 场景 | 修复前峰值 RSS | 修复后峰值 RSS | 数值核对 |
+| --- | ---: | ---: | --- |
+| 128 帧 × 2 声道 × 2,049 bins，同一 artifact 连续读写 8 轮 | 148.83 MB；每轮后从 31 MB 累积至 149 MB | 53.48 MB；预热后约 53 MB | 回读相等、压缩 artifact 摘要一致 |
+| 60 秒、48 kHz 双声道文件分析，默认 FFT 配置 | 209.37 MB | 155.96 MB | 均为 1,403 帧 × 4,097 bins，全部 PSD 位模式校验和一致 |
+
+这些数值是本机受控样本的观测，不是实际曲库峰值或内存上限。最终 `SpectrumFeatures.frames` 和 artifact 编解码仍会物化整曲 PSD，超长录音的 GB 级峰值尚未根治；分块特征存储和磁盘保留策略不在本轮修复中。
+
+冻结源码版本：`LocalStore.swift` SHA-256 `ef38b5d0f4868a7299bf74cec6d4a10e6db5d623ca3779d162bd2224668e0fcd`；`MatchingService.swift` `7cd4ec35799c7a17586b89ce2286dbef08d864391e3d49fa2cef8f314a1d059d`；`SpectrumAnalyzer.swift` `29c79ebd13a83647c769ed614eedace8c939c6dadc8a6a88435ef786e4f5a0f7`。所有源码与探针哈希见 `test-output/verification/memory-fix-source-before-checks.json`；串行检查期间源码未变。
+
+验证通过：`verify-artifact-memory.sh`；`verify-streaming-analysis.sh`（8,191/8,192/8,193 帧、hop 尾段、65,536 块边界、44.1/48 kHz 双声道、逐位 PSD/metadata 一致与尾部 NaN）；`verify-matching-memory.sh`（真实 production extension、三个连续重算、仅最新结果、无取消错误、并发峰值 1，删除等待语句的临时反例按预期失败）；`verify-core.sh`、`verify-personal.sh` 16 项、`verify-recording-merge.sh`、`verify-recording-analysis.sh`，以及 `swift build -c debug --jobs 1` 和 `git diff --check`。执行结果与日志在 `test-output/verification/memory-fix-checks.json`。XCTest 未运行，未做现场长录音或整库压力测试。
+
+正式 App SHA-256 仍为 `aa9b8a3cbcc0f76c0ca428dfc62e3a29c66d1f730f809b1bce6cb9fe580a7f25`。本轮未更新、启动或重启主 App，未控制播放器/采集，未写真实数据库或音频/频谱文件；也未清理历史数据。
+
+## 2026-09-30 精简频谱离线验证（正式采用前的记录）
+
+本轮按用户要求保留频谱、将原始录音作为少量缓存。源码增加 1/48 octave 的相邻 native FFT cell 聚合、0.01 dB UInt16 PSD 编码和多段引用 manifest。保留全部时间帧、左右声道、功率尺度及真实覆盖信息；不能还原合并频格内的原始 PSD，也不保证窄峰响应或非常接近的排名完全不变。新的文件分析路径直接逐帧产生 compact PSD，不先物化整曲 native PSD；匹配仍需要物化整曲 compact frames，内存随时长增长，并非固定上限。
+
+真实只读短 CAF（29.514667 秒、48 kHz 双声道、688 帧）使用最终生产格式，4097 bins 减少到 355 bands。相同 binary plist + LZFSE 条件下，native 文件 43,932,102 字节，compact 文件 948,114 字节，约缩小 46.3 倍。按该样本速率外推当前 32.22 小时，频谱约 3.73 GB；该数字是单样本投影，不能冒充历史整库实测。源 CAF 的 SHA-256、大小和修改时间在测试前后相同。
+
+同一真实样本经 compact 编码和解码后再匹配拉斐尔、HE1 与 Alter Ego：两参考的个人整体偏差最大变化约 0.00183 dB，经典 D 最大变化约 0.00364 dB，Dhigh 最大变化约 0.00510 dB，最佳参考未变；Alter Ego 的最差帧位置从 22.826667 秒变为 19.669333 秒，不能宣称全部诊断或时间定位相同。独立的 12 kHz 合并频格内窄峰压力样本产生约 0.071 dB 的 D 差异、0.102 dB 的 Dhigh 差异，验证了精简表示的近似边界。结果说明保持 partial，没有将数值共同范围当作实际测量的统一可靠频段。
+
+原生 Swift probes 已通过：compact codec 的 legacy 逐位兼容、零/亚正规值/超动态范围 fallback 与错误格式拒绝；4097-bin compact 网格积分功率、20 Hz/10 kHz/20 kHz/Nyquist 边界、流式 compact 与 native 后聚合一致；经典和个人匹配；legacy PCM streaming 回归；生产录音队列的短段等待、无 PCM 时从有效 leaf 恢复、追加续录、混合 legacy/compact 引用与畸形 manifest 拒绝；录音合并与 Debug 构建。实测版本、逐项状态及日志位于本机忽略目录 `test-output/verification/compact-check-results.json`、`compact-codec-result.json`、`compact-matching-real-check.json`。XCTest 未运行，也未做正式 App 的新格式 UI 验收。
+
+用户已授权在测试及实际压缩结果确认后处理历史录音，并明确授权更新主 App。旧 build14 不认识 compact UInt16 与引用 manifest，因此必须先验证新版读取，再切换活动库。离线工具先只读源 SQLite 和频谱，生成独立数据库及 Features 副本，保留未知文档字段和所有非 track 文档；在逐项回读、活动库切换兼容问题解决之前，不删除原数据。最新历史转换状态与结果另存私有 `共鸣资料/compact-migration-20260930`，不随公开仓库分发。

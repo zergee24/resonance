@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import ResonanceCore
 
 // The harness compiles the production app sources without SwiftPM's resource
@@ -16,7 +17,109 @@ struct RecordingMergeHarness {
         try checkDisjointOffsets()
         try checkCrossSegmentOverlap()
         try checkRejectsUnknownOffsetAndGrid()
+        try checkShortSegmentEligibilityAndFilteredAggregation()
         print("recording merge harness: PASS")
+    }
+
+    private static func checkShortSegmentEligibilityAndFilteredAggregation() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("resonance-short-segment-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sampleRate = 48_000.0
+        let frameLength = 8_192
+        let analyzer = SpectrumAnalyzer(configuration: .init(
+            frameDurationSeconds: Double(frameLength) / sampleRate,
+            minimumFrameLength: frameLength,
+            maximumFrameLength: frameLength
+        ))
+        var validFeature: SpectrumFeatures?
+        var validURL: URL?
+        var shortURL: URL?
+        for sampleCount in [8_191, 8_192, 8_193] {
+            let url = try writePCM(sampleCount: sampleCount, sampleRate: sampleRate, directory: directory)
+            let original = try Data(contentsOf: url)
+            let eligibility = try analyzer.inputEligibility(fileURL: url)
+            let productionEligibility = try AppModel.recordingAnalysisEligibility(segmentID: UUID(), audioURL: url)
+            try require(eligibility.sampleCount == Int64(sampleCount), "eligibility sample count changed")
+            try require(eligibility.requiredFrameLength == frameLength, "eligibility did not use the configured frame length")
+            try require(eligibility.hasSpectrumFrame == (sampleCount >= frameLength), "short/valid frame boundary was classified incorrectly")
+            try require(
+                productionEligibility.action == (sampleCount >= frameLength ? .analyze : .waitForMoreAudio),
+                "recording queue eligibility disagrees with the analyzer"
+            )
+            if sampleCount < frameLength {
+                shortURL = url
+                do {
+                    _ = try analyzer.analyze(fileURL: url)
+                    throw HarnessError(message: "short segment unexpectedly produced a spectrum")
+                } catch ResonanceCoreError.noSpectrumFrames {
+                    // The production recording path filters this known input
+                    // condition before analysis; no zero-padding is allowed.
+                }
+            } else {
+                validFeature = try analyzer.analyze(fileURL: url)
+                validURL = url
+            }
+            try require(Data(contentsOf: url) == original, "analysis modified the source PCM/container")
+        }
+
+        guard let validFeature, let validURL, let shortURL else {
+            throw HarnessError(message: "valid boundary sample did not produce a feature")
+        }
+        let shortDecision = try AppModel.recordingAnalysisEligibility(segmentID: UUID(), audioURL: shortURL)
+        let validDecision = try AppModel.recordingAnalysisEligibility(segmentID: UUID(), audioURL: validURL)
+        try require(shortDecision.action == .waitForMoreAudio, "all-short row did not remain deferred")
+        try require(validDecision.action == .analyze, "a later valid segment was not eligible for recovery")
+        let validDuration = Double(8_193) / sampleRate
+        let validID = UUID()
+        let validSegment = RecordingSegment(
+            id: validID,
+            audioPath: validURL.path,
+            mediaStartSeconds: 1,
+            capturedSeconds: validDuration,
+            sampleRate: sampleRate,
+            channels: 1
+        )
+        let validCoverage = try Coverage(
+            kind: .partial,
+            mediaDurationSeconds: 2,
+            recordedDurationSeconds: validDuration,
+            intervals: [try TimeRange(startSeconds: 1, endSeconds: 1 + validDuration)]
+        )
+        let merged = try AppModel.mergeFeatures(
+            [(validSegment, validFeature)],
+            track: TrackEntry(title: "short + valid", artist: "", duration: 2),
+            coverage: validCoverage
+        )
+        try require(merged.frames.count == validFeature.frames.count, "valid segment was lost when a short segment was present")
+        try require(merged.coverage == validCoverage, "aggregate coverage included the deferred short segment")
+        try require(!merged.coverage.intervals.contains(where: { $0.startSeconds == 0 }), "short segment was advertised in aggregate coverage")
+
+        print("PASS short segments: 8191 waits, 8192/8193 analyze, PCM preserved, aggregate excludes deferred short input")
+    }
+
+    private static func writePCM(sampleCount: Int, sampleRate: Double, directory: URL) throws -> URL {
+        let url = directory.appendingPathComponent("\(sampleCount)-\(UUID().uuidString).caf")
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
+              let file = try? AVAudioFile(
+                forWriting: url,
+                settings: format.settings,
+                commonFormat: .pcmFormatFloat32,
+                interleaved: false
+              ),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(sampleCount)) else {
+            throw HarnessError(message: "could not create synthetic CAF")
+        }
+        buffer.frameLength = AVAudioFrameCount(sampleCount)
+        if let channel = buffer.floatChannelData?[0] {
+            for index in 0..<sampleCount {
+                channel[index] = Float(sin(2 * Double.pi * 440 * Double(index) / sampleRate))
+            }
+        }
+        try file.write(from: buffer)
+        return url
     }
 
     private static func checkSingleSegmentKeepsSTFTOverlap() throws {

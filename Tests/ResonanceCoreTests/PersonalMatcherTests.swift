@@ -174,12 +174,137 @@ final class PersonalMatcherTests: XCTestCase {
             references: [reference]
         )
         XCTAssertNil(invalid.bestReferenceID)
-        XCTAssertTrue(invalid.limitations.contains { $0.contains("0 < alpha") })
+        XCTAssertTrue(invalid.limitations.contains { $0.contains("0 < spectral alpha") })
+    }
+
+    func testLegacyAlphaMapsToBothWeightDimensionsAndScenariosAreIndependent() throws {
+        let flat = try makeCurve { _ in 0 }
+        let headphone = Headphone(name: "flat", owned: true, curve: flat)
+        let features = try makeFeatures(frames: [
+            spectrum(scale: 0.1) { _ in 1 },
+            spectrum(scale: 1.0) { _ in 1 }
+        ])
+
+        let legacy = PersonalMatcher.Configuration(compressionExponent: 0.3)
+        XCTAssertEqual(legacy.compressionExponent, 0.3, accuracy: 1e-12)
+        XCTAssertEqual(legacy.temporalExponent, 0.3, accuracy: 1e-12)
+        XCTAssertTrue(legacy.isValid)
+
+        let baseline = PersonalMatcher(configuration: legacy).match(
+            features: features,
+            headphone: headphone,
+            references: [flat]
+        )
+        XCTAssertEqual(baseline.sensitivityDiagnostics.map(\.id), [
+            "baseline", "spectral-0.2", "spectral-0.5", "temporal-0", "temporal-1"
+        ])
+        XCTAssertEqual(baseline.sensitivityDiagnostics.count, Set(baseline.sensitivityDiagnostics.map(\.id)).count)
+
+        let temporalZero = try XCTUnwrap(baseline.sensitivityDiagnostics.first { $0.id == "temporal-0" })
+        let independent = PersonalMatcher(configuration: .init(
+            compressionExponent: 0.3,
+            temporalExponent: 0,
+            includeSensitivityDiagnostics: false
+        )).match(features: features, headphone: headphone, references: [flat])
+        XCTAssertEqual(
+            try XCTUnwrap(temporalZero.references.first?.overallDB),
+            try XCTUnwrap(independent.matches.first?.overallDB),
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(temporalZero.bestReferenceID, independent.bestReferenceID)
+
+        let disabled = PersonalMatcher(configuration: .init(
+            compressionExponent: 0.3,
+            temporalExponent: 0.3,
+            includeSensitivityDiagnostics: false
+        )).match(features: features, headphone: headphone, references: [flat])
+        XCTAssertTrue(disabled.sensitivityDiagnostics.isEmpty)
+        XCTAssertEqual(
+            try XCTUnwrap(disabled.matches.first?.overallDB),
+            try XCTUnwrap(baseline.matches.first?.overallDB),
+            accuracy: 1e-12
+        )
+    }
+
+    func testLowEnergyNarrowBandResponseRemainsVisibleInEvidence() throws {
+        let reference = try makeCurve { _ in 0 }
+        let narrowPeak = try makeCurve(frequencies: [20, 990, 1_000, 1_010, 5_000, 10_000, 12_500, 16_000, 20_000, 24_000]) { frequency in
+            abs(frequency - 1_000) < 0.1 ? 6 : 0
+        }
+        let features = try makeFeatures(frames: [
+            spectrum { frequency in abs(frequency - 1_000) < 0.1 ? 0.000001 : 1 }
+        ])
+        let result = PersonalMatcher().match(
+            features: features,
+            headphone: Headphone(name: "narrow", owned: true, curve: narrowPeak),
+            references: [reference]
+        )
+        let evidence = try XCTUnwrap(result.matches.first?.frequencyEvidence.first { $0.lowerHz <= 1_000 && $0.upperHz > 1_000 })
+        XCTAssertNotNil(evidence.deviationDB)
+        XCTAssertNotEqual(evidence.state, .outsideSupport)
+    }
+
+    func testMonoPersonalMatchIgnoresUnusedRightCurveButStereoUsesIt() throws {
+        let flat = try makeCurve { _ in 0 }
+        let narrowRight = try makeCurve(
+            frequencies: [1_000, 2_000, 5_000],
+            validMinHz: 1_000,
+            validMaxHz: 5_000
+        ) { _ in 0 }
+        let disjointRight = try makeCurve(
+            frequencies: [30_000, 35_000, 40_000],
+            validMinHz: 30_000,
+            validMaxHz: 40_000
+        ) { _ in 0 }
+        let mono = try makeFeatures(channelCount: 1, frames: [spectrum { _ in 1 }])
+        let stereo = try makeFeatures(channelCount: 2, frames: [spectrum { _ in 1 }])
+        let leftOnly = Headphone(name: "left-only", owned: true, curve: flat)
+
+        let monoBaseline = PersonalMatcher().match(features: mono, headphone: leftOnly, references: [flat])
+        let monoNarrowRight = PersonalMatcher().match(
+            features: mono,
+            headphone: Headphone(name: "mono-narrow-right", owned: true, curve: flat, rightCurve: narrowRight),
+            references: [flat]
+        )
+        let monoDisjointRight = PersonalMatcher().match(
+            features: mono,
+            headphone: Headphone(name: "mono-disjoint-right", owned: true, curve: flat, rightCurve: disjointRight),
+            references: [flat]
+        )
+        for result in [monoNarrowRight, monoDisjointRight] {
+            XCTAssertEqual(result.bestReferenceID, monoBaseline.bestReferenceID)
+            XCTAssertEqual(result.commonMinimumHz, monoBaseline.commonMinimumHz)
+            XCTAssertEqual(result.commonMaximumHz, monoBaseline.commonMaximumHz)
+            let expected = try XCTUnwrap(monoBaseline.matches.first)
+            let actual = try XCTUnwrap(result.matches.first)
+            XCTAssertEqual(try XCTUnwrap(actual.overallDB), try XCTUnwrap(expected.overallDB), accuracy: 1e-12)
+            XCTAssertEqual(try XCTUnwrap(actual.highDB), try XCTUnwrap(expected.highDB), accuracy: 1e-12)
+            XCTAssertEqual(try XCTUnwrap(actual.frameP90DB), try XCTUnwrap(expected.frameP90DB), accuracy: 1e-12)
+            XCTAssertEqual(try XCTUnwrap(actual.worstFrameDB), try XCTUnwrap(expected.worstFrameDB), accuracy: 1e-12)
+            XCTAssertEqual(try XCTUnwrap(actual.globalLevelOffsetDB), try XCTUnwrap(expected.globalLevelOffsetDB), accuracy: 1e-12)
+        }
+
+        let stereoNarrowRight = PersonalMatcher().match(
+            features: stereo,
+            headphone: Headphone(name: "stereo-narrow-right", owned: true, curve: flat, rightCurve: narrowRight),
+            references: [flat]
+        )
+        XCTAssertEqual(try XCTUnwrap(stereoNarrowRight.commonMinimumHz), 1_000, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(stereoNarrowRight.commonMaximumHz), 5_000, accuracy: 1e-12)
+        let stereoDisjointRight = PersonalMatcher().match(
+            features: stereo,
+            headphone: Headphone(name: "stereo-disjoint-right", owned: true, curve: flat, rightCurve: disjointRight),
+            references: [flat]
+        )
+        XCTAssertNil(stereoDisjointRight.bestReferenceID)
+        XCTAssertEqual(stereoDisjointRight.matches.first?.status, .unavailable)
     }
 
     private func makeCurve(
         id: UUID = UUID(),
         frequencies: [Double]? = nil,
+        validMinHz: Double? = nil,
+        validMaxHz: Double? = nil,
         _ value: (Double) -> Double
     ) throws -> Curve {
         let frequencies = frequencies ?? curveFrequencies
@@ -189,6 +314,8 @@ final class PersonalMatcherTests: XCTestCase {
             points: frequencies.map { try! CurvePoint(frequencyHz: $0, decibels: value($0)) },
             source: "test",
             measurementSystem: "synthetic",
+            validMinHz: validMinHz,
+            validMaxHz: validMaxHz,
             isReference: true
         )
     }
@@ -196,6 +323,7 @@ final class PersonalMatcherTests: XCTestCase {
     private func makeFeatures(
         frequencies: [Double]? = nil,
         frames: [[Double]],
+        channelCount: Int = 2,
         coverage: CoverageKind = .complete,
         hasUnexplainedGaps: Bool = false
     ) throws -> SpectrumFeatures {
@@ -210,12 +338,12 @@ final class PersonalMatcherTests: XCTestCase {
             SpectrumFrame(
                 startTimeSeconds: Double(index),
                 sampleCount: 1_024,
-                powerSpectralDensityByChannel: [values, values]
+                powerSpectralDensityByChannel: Array(repeating: values, count: channelCount)
             )
         }
         return SpectrumFeatures(
             sampleRate: 48_000,
-            channelCount: 2,
+            channelCount: channelCount,
             frequencyBinsHz: frequencies,
             frames: spectrumFrames,
             durationSeconds: Double(frames.count),
@@ -223,7 +351,7 @@ final class PersonalMatcherTests: XCTestCase {
             validMinHz: frequencies.first ?? 0,
             validMaxHz: frequencies.last ?? 0,
             frequencyValidity: .mathematicalNyquist,
-            format: AudioFormatMetadata(sampleRate: 48_000, channelCount: 2),
+            format: AudioFormatMetadata(sampleRate: 48_000, channelCount: channelCount),
             parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 1 / 48_000)
         )
     }

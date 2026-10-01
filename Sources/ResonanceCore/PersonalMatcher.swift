@@ -112,6 +112,58 @@ public struct PersonalReferenceMatch: Sendable, Equatable, Identifiable {
     public var bandEvidence: [PersonalBandEvidence] { frequencyEvidence }
 }
 
+/// One reference's result under a sensitivity scenario.  The value is the
+/// same descriptive residual used for normal ranking; it is not a liking
+/// probability or a confidence interval.
+public struct PersonalSensitivityReference: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public let referenceID: UUID
+    public let referenceName: String
+    public let overallDeviationDB: Double?
+
+    public init(
+        referenceID: UUID,
+        referenceName: String,
+        overallDeviationDB: Double?
+    ) {
+        self.id = referenceID
+        self.referenceID = referenceID
+        self.referenceName = referenceName
+        self.overallDeviationDB = overallDeviationDB
+    }
+
+    public var overallDB: Double? { overallDeviationDB }
+}
+
+/// A small, independent sensitivity scenario for the two weighting
+/// heuristics in PersonalMatcher.  This describes engineering model spread;
+/// it is not a statistical confidence interval or a personal-preference
+/// probability.
+public struct PersonalSensitivityScenario: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let spectralExponent: Double
+    public let temporalExponent: Double
+    public let references: [PersonalSensitivityReference]
+    public let bestReferenceID: UUID?
+    public let limitations: [String]
+
+    public init(
+        id: String,
+        spectralExponent: Double,
+        temporalExponent: Double,
+        references: [PersonalSensitivityReference],
+        bestReferenceID: UUID?,
+        limitations: [String]
+    ) {
+        self.id = id
+        self.spectralExponent = spectralExponent
+        self.temporalExponent = temporalExponent
+        self.references = references
+        self.bestReferenceID = bestReferenceID
+        self.limitations = limitations
+    }
+}
+
 public struct PersonalMatchResult: Sendable, Equatable {
     public let matches: [PersonalReferenceMatch]
     public let bestReferenceID: UUID?
@@ -119,6 +171,7 @@ public struct PersonalMatchResult: Sendable, Equatable {
     public let commonMinimumHz: Double?
     public let commonMaximumHz: Double?
     public let limitations: [String]
+    public let sensitivityDiagnostics: [PersonalSensitivityScenario]
 
     public init(
         matches: [PersonalReferenceMatch],
@@ -126,7 +179,8 @@ public struct PersonalMatchResult: Sendable, Equatable {
         modelVersion: String,
         commonMinimumHz: Double? = nil,
         commonMaximumHz: Double? = nil,
-        limitations: [String] = []
+        limitations: [String] = [],
+        sensitivityDiagnostics: [PersonalSensitivityScenario] = []
     ) {
         self.matches = matches
         self.bestReferenceID = bestReferenceID
@@ -134,6 +188,7 @@ public struct PersonalMatchResult: Sendable, Equatable {
         self.commonMinimumHz = commonMinimumHz
         self.commonMaximumHz = commonMaximumHz
         self.limitations = limitations
+        self.sensitivityDiagnostics = sensitivityDiagnostics
     }
 }
 
@@ -141,17 +196,40 @@ public struct PersonalMatchResult: Sendable, Equatable {
 /// recorded per-frame PSD.  The calculation is deliberately descriptive: no
 /// subjective 0–100 score, semantic labels, ML, or ISO loudness model is used.
 public struct PersonalMatcher: Sendable {
-    public static let modelVersion = "personal-v1-glasberg-moore-band-power"
+    public static let modelVersion = "personal-v2-independent-spectral-temporal-weighting"
 
     public struct Configuration: Sendable, Equatable {
+        /// Compression of within-frame spectral band energy. This is an
+        /// engineering weighting heuristic, not an ISO loudness exponent.
         public let compressionExponent: Double
+        /// Compression of frame activity/energy over time. This is kept
+        /// independent from the within-frame spectral weighting heuristic.
+        public let temporalExponent: Double
+        /// Sensitivity scenarios are diagnostics only and never affect the
+        /// default match or best-reference selection.
+        public let includeSensitivityDiagnostics: Bool
 
-        public init(compressionExponent: Double = 0.3) {
+        /// Descriptive alias for callers that want to name the two axes
+        /// explicitly; `compressionExponent` remains the source-compatible
+        /// stored property.
+        public var spectralExponent: Double { compressionExponent }
+
+        /// The legacy initializer intentionally maps one alpha to both
+        /// dimensions, preserving source compatibility and the old default
+        /// behavior. New callers can set the two exponents independently.
+        public init(
+            compressionExponent: Double = 0.3,
+            temporalExponent: Double? = nil,
+            includeSensitivityDiagnostics: Bool = true
+        ) {
             self.compressionExponent = compressionExponent
+            self.temporalExponent = temporalExponent ?? compressionExponent
+            self.includeSensitivityDiagnostics = includeSensitivityDiagnostics
         }
 
         public var isValid: Bool {
-            compressionExponent.isFinite && compressionExponent > 0 && compressionExponent <= 1
+            compressionExponent.isFinite && compressionExponent > 0 && compressionExponent <= 1 &&
+                temporalExponent.isFinite && temporalExponent >= 0 && temporalExponent <= 1
         }
     }
 
@@ -168,11 +246,11 @@ public struct PersonalMatcher: Sendable {
     ) -> PersonalMatchResult {
         let commonLimitations = baseLimitations(features: features, references: references)
         guard configuration.isValid else {
-            let limitation = "compressionExponent 必须满足 0 < alpha ≤ 1，当前值无效。"
+            let limitation = "compressionExponent 必须满足 0 < spectral alpha ≤ 1，temporalExponent 必须满足 0 ≤ alpha ≤ 1，当前值无效。"
             return PersonalMatchResult(
                 matches: references.map { unavailableMatch(reference: $0, limitations: commonLimitations + [limitation]) },
                 bestReferenceID: nil,
-                modelVersion: Self.modelVersion,
+                modelVersion: resultModelVersion(for: features),
                 limitations: commonLimitations + [limitation]
             )
         }
@@ -180,7 +258,7 @@ public struct PersonalMatcher: Sendable {
             return PersonalMatchResult(
                 matches: [],
                 bestReferenceID: nil,
-                modelVersion: Self.modelVersion,
+                modelVersion: resultModelVersion(for: features),
                 limitations: commonLimitations + ["没有提供参考曲线。"]
             )
         }
@@ -189,23 +267,25 @@ public struct PersonalMatcher: Sendable {
             return PersonalMatchResult(
                 matches: references.map { unavailableMatch(reference: $0, limitations: commonLimitations + [limitation]) },
                 bestReferenceID: nil,
-                modelVersion: Self.modelVersion,
+                modelVersion: resultModelVersion(for: features),
                 limitations: commonLimitations + [limitation]
             )
         }
         guard validFeatureShape(features) else {
-            let limitation = "频率网格或逐声道 PSD 形状无效，无法计算。"
+            let limitation = "频率网格、显式 cell 边界或逐声道 PSD 形状无效，无法计算。"
             return PersonalMatchResult(
                 matches: references.map { unavailableMatch(reference: $0, limitations: commonLimitations + [limitation]) },
                 bestReferenceID: nil,
-                modelVersion: Self.modelVersion,
+                modelVersion: resultModelVersion(for: features),
                 limitations: commonLimitations + [limitation]
             )
         }
         guard let support = commonSupport(
             features: features,
             headphoneCurve: headphoneCurve,
-            rightCurve: headphone.rightCurve,
+            // A mono recording has no right-channel PSD, so an optional
+            // right-channel measurement must not constrain its support.
+            rightCurve: features.channelCount > 1 ? headphone.rightCurve : nil,
             eqCurve: headphone.eqCurve,
             references: references
         ) else {
@@ -213,7 +293,7 @@ public struct PersonalMatcher: Sendable {
             return PersonalMatchResult(
                 matches: references.map { unavailableMatch(reference: $0, limitations: commonLimitations + [limitation]) },
                 bestReferenceID: nil,
-                modelVersion: Self.modelVersion,
+                modelVersion: resultModelVersion(for: features),
                 limitations: commonLimitations + [limitation]
             )
         }
@@ -227,18 +307,34 @@ public struct PersonalMatcher: Sendable {
             headphoneCurve: headphoneCurve
         )
         let rankingUpper = min(support.upperHz, 20_000)
+        let baselineWeights = makeWeightPlan(
+            prepared: prepared,
+            spectralExponent: configuration.compressionExponent,
+            temporalExponent: configuration.temporalExponent
+        )
 
         // The spectral grid, band overlaps, integrated PSD energies, and
-        // headphone interpolation are shared by every reference. A reference
-        // only needs one response lookup per FFT bin and then a compact
-        // frame×channel×band pass.
-        let matches = references.map { reference in
-            evaluate(
-                reference: reference,
+        // headphone interpolation are shared by every reference and every
+        // sensitivity scenario. Response observations are computed once per
+        // reference; scenarios only reuse those observations with another
+        // compact weight plan.
+        let responseObservations = references.map { reference in
+            let referenceValues = features.frequencyBinsHz.map { reference.value(at: $0) }
+            return makeReferenceObservations(
                 features: features,
+                referenceValues: referenceValues,
+                prepared: prepared,
+                headphoneValues: prepared.headphoneValues
+            )
+        }
+        let matches = references.indices.map { index in
+            evaluate(
+                reference: references[index],
                 support: support,
                 definitions: definitions,
                 prepared: prepared,
+                observations: responseObservations[index],
+                weights: baselineWeights,
                 rankingUpper: rankingUpper,
                 commonLimitations: commonLimitations
             )
@@ -253,14 +349,152 @@ public struct PersonalMatcher: Sendable {
                 return left < right
             }?.referenceID
 
+        let sensitivityDiagnostics = configuration.includeSensitivityDiagnostics
+            ? makeSensitivityDiagnostics(
+                references: references,
+                support: support,
+                definitions: definitions,
+                prepared: prepared,
+                responseObservations: responseObservations,
+                rankingUpper: rankingUpper,
+                commonLimitations: commonLimitations,
+                baselineWeights: baselineWeights
+            )
+            : []
+
         return PersonalMatchResult(
             matches: matches,
             bestReferenceID: bestReferenceID,
-            modelVersion: Self.modelVersion,
+            modelVersion: resultModelVersion(for: features),
             commonMinimumHz: support.lowerHz,
             commonMaximumHz: support.upperHz,
-            limitations: commonLimitations + support.limitations
+            limitations: commonLimitations + support.limitations,
+            sensitivityDiagnostics: sensitivityDiagnostics
         )
+    }
+
+    private struct SensitivityConfiguration {
+        let id: String
+        let spectralExponent: Double
+        let temporalExponent: Double
+    }
+
+    private func makeSensitivityDiagnostics(
+        references: [Curve],
+        support: CommonSupport,
+        definitions: [BandDefinition],
+        prepared: PreparedBands,
+        responseObservations: [[ReferenceBandObservation]],
+        rankingUpper: Double,
+        commonLimitations: [String],
+        baselineWeights: WeightPlan
+    ) -> [PersonalSensitivityScenario] {
+        let scenarios = sensitivityConfigurations()
+        let explanation = "敏感性情景仅表示独立谱内权重与帧活动权重启发式造成的工程情景跨度，不是置信区间、测量不确定度或个人喜欢概率。"
+
+        return scenarios.map { scenario in
+            let weights: WeightPlan
+            if scenario.spectralExponent == configuration.compressionExponent &&
+                scenario.temporalExponent == configuration.temporalExponent {
+                weights = baselineWeights
+            } else {
+                weights = makeWeightPlan(
+                    prepared: prepared,
+                    spectralExponent: scenario.spectralExponent,
+                    temporalExponent: scenario.temporalExponent
+                )
+            }
+            let values = references.indices.map { index in
+                let overall = evaluateOverall(
+                    observations: responseObservations[index],
+                    definitions: definitions,
+                    prepared: prepared,
+                    weights: weights,
+                    rankingUpper: rankingUpper
+                )
+                return PersonalSensitivityReference(
+                    referenceID: references[index].id,
+                    referenceName: references[index].name,
+                    overallDeviationDB: overall
+                )
+            }
+            let best = values
+                .filter { $0.overallDeviationDB?.isFinite == true }
+                .min { lhs, rhs in
+                    guard let left = lhs.overallDeviationDB, let right = rhs.overallDeviationDB else {
+                        return lhs.overallDeviationDB != nil
+                    }
+                    if left == right { return lhs.referenceID.uuidString < rhs.referenceID.uuidString }
+                    return left < right
+                }?.referenceID
+            let scenarioWeightLimitation = "频谱权重是归一化逐带功率的 \(scenario.spectralExponent) 次压缩启发式；帧活动权重是非零帧能量的 \(scenario.temporalExponent) 次压缩启发式，二者都不是 ISO 响度或听阈模型。"
+            var limitations: [String] = []
+            for limitation in commonLimitations.filter({ !$0.contains("频谱权重是") }) +
+                [scenarioWeightLimitation] + support.limitations + [explanation]
+                where !limitations.contains(limitation) {
+                limitations.append(limitation)
+            }
+            return PersonalSensitivityScenario(
+                id: scenario.id,
+                spectralExponent: scenario.spectralExponent,
+                temporalExponent: scenario.temporalExponent,
+                references: values,
+                bestReferenceID: best,
+                limitations: limitations
+            )
+        }
+    }
+
+    private func sensitivityConfigurations() -> [SensitivityConfiguration] {
+        let base = SensitivityConfiguration(
+            id: "baseline",
+            spectralExponent: configuration.compressionExponent,
+            temporalExponent: configuration.temporalExponent
+        )
+        let candidates = [
+            base,
+            SensitivityConfiguration(id: "spectral-0.2", spectralExponent: 0.2, temporalExponent: configuration.temporalExponent),
+            SensitivityConfiguration(id: "spectral-0.5", spectralExponent: 0.5, temporalExponent: configuration.temporalExponent),
+            SensitivityConfiguration(id: "temporal-0", spectralExponent: configuration.compressionExponent, temporalExponent: 0),
+            SensitivityConfiguration(id: "temporal-1", spectralExponent: configuration.compressionExponent, temporalExponent: 1)
+        ]
+        var result: [SensitivityConfiguration] = []
+        for candidate in candidates where candidate.spectralExponent.isFinite && candidate.temporalExponent.isFinite {
+            guard !result.contains(where: {
+                $0.spectralExponent == candidate.spectralExponent &&
+                    $0.temporalExponent == candidate.temporalExponent
+            }) else { continue }
+            result.append(candidate)
+        }
+        return result
+    }
+
+    private func evaluateOverall(
+        observations: [ReferenceBandObservation],
+        definitions: [BandDefinition],
+        prepared: PreparedBands,
+        weights: WeightPlan,
+        rankingUpper: Double
+    ) -> Double? {
+        let ranking = observations.filter { observation in
+            let definition = definitions[observation.base.bandIndex]
+            return definition.isRankingBand &&
+                definition.lowerHz < rankingUpper &&
+                observation.deviationDB != nil
+        }
+        let usable = ranking.filter { observation in
+            observation.base.energy > 0 && observationWeight(observation, in: observations, weights: weights) > 0
+        }
+        guard prepared.totalMainEnergy > 0 else { return nil }
+        let gain = weightedMean(usable.compactMap { observation in
+            guard let value = observation.deviationDB else { return nil }
+            return (value, observationWeight(observation, in: observations, weights: weights))
+        })
+        guard gain.isFinite else { return nil }
+        return weightedRMS(usable.compactMap { observation in
+            guard let value = observation.deviationDB else { return nil }
+            return (value - gain, observationWeight(observation, in: observations, weights: weights))
+        })
     }
 
     private struct CommonSupport {
@@ -298,19 +532,34 @@ public struct PersonalMatcher: Sendable {
         let bandIndex: Int
         let channelIndex: Int
         let energy: Double
-        let frameWeight: Double
-        let spectralWeight: Double
+    }
+
+    private struct WeightPlan {
+        let frameWeights: [Double]
+        let spectralWeights: [Double]
+
+        func frameWeight(for observation: BandBaseObservation) -> Double {
+            guard observation.frameIndex >= 0 && observation.frameIndex < frameWeights.count else { return 0 }
+            return frameWeights[observation.frameIndex]
+        }
+
+        func spectralWeight(for index: Int) -> Double {
+            guard index >= 0 && index < spectralWeights.count else { return 0 }
+            return spectralWeights[index]
+        }
     }
 
     private struct PreparedBands {
         let plans: [BandPlan]
         let observations: [BandBaseObservation]
+        let frameMainEnergies: [Double]
         let totalMainEnergy: Double
         let totalAllEnergy: Double
         let headphoneValues: [[Double?]]
     }
 
     private struct ReferenceBandObservation {
+        let index: Int
         let base: BandBaseObservation
         let deviationDB: Double?
         let responseEnergy: Double
@@ -324,28 +573,27 @@ public struct PersonalMatcher: Sendable {
 
     private func evaluate(
         reference: Curve,
-        features: SpectrumFeatures,
         support: CommonSupport,
         definitions: [BandDefinition],
         prepared: PreparedBands,
+        observations: [ReferenceBandObservation],
+        weights: WeightPlan,
         rankingUpper: Double,
         commonLimitations: [String]
     ) -> PersonalReferenceMatch {
-        let referenceValues = features.frequencyBinsHz.map { reference.value(at: $0) }
-        let responseObservations = makeReferenceObservations(
-            features: features,
-            referenceValues: referenceValues,
-            prepared: prepared,
-            headphoneValues: prepared.headphoneValues
-        )
-        let ranking = responseObservations.filter { observation in
+        let ranking = observations.filter { observation in
             let definition = definitions[observation.base.bandIndex]
             return definition.isRankingBand &&
                 definition.lowerHz < rankingUpper &&
                 observation.deviationDB != nil
         }
-        let usableRanking = ranking.filter { $0.base.energy > 0 && $0.base.frameWeight * $0.base.spectralWeight > 0 }
-        let rankingWeight = usableRanking.reduce(0) { $0 + $1.base.frameWeight * $1.base.spectralWeight }
+        let usableRanking = ranking.filter { observation in
+            let weight = observationWeight(observation, in: observations, weights: weights)
+            return observation.base.energy > 0 && weight > 0
+        }
+        let rankingWeight = usableRanking.reduce(0) { partial, observation in
+            partial + observationWeight(observation, in: observations, weights: weights)
+        }
 
         guard prepared.totalMainEnergy > 0, rankingWeight.isFinite, rankingWeight > 0 else {
             let limitation = prepared.totalMainEnergy > 0
@@ -360,7 +608,8 @@ public struct PersonalMatcher: Sendable {
                 frequencyEvidence: makeBandEvidence(
                     definitions: definitions,
                     plans: prepared.plans,
-                    observations: responseObservations,
+                    observations: observations,
+                    weights: weights,
                     globalGain: nil,
                     totalAllEnergy: prepared.totalAllEnergy,
                     support: support
@@ -374,26 +623,27 @@ public struct PersonalMatcher: Sendable {
         let globalGain = weightedMean(
             usableRanking.compactMap { observation in
                 guard let deviationDB = observation.deviationDB else { return nil }
-                return (deviationDB, observation.base.frameWeight * observation.base.spectralWeight)
+                return (deviationDB, observationWeight(observation, in: observations, weights: weights))
             }
         )
         let overall = weightedRMS(
             usableRanking.compactMap { observation in
                 guard let deviationDB = observation.deviationDB else { return nil }
-                return (deviationDB - globalGain, observation.base.frameWeight * observation.base.spectralWeight)
+                return (deviationDB - globalGain, observationWeight(observation, in: observations, weights: weights))
             }
         )
         let high = weightedRMS(
             usableRanking.compactMap { observation in
                 let definition = definitions[observation.base.bandIndex]
                 guard definition.isHighFrequency, let deviationDB = observation.deviationDB else { return nil }
-                return (deviationDB - globalGain, observation.base.frameWeight * observation.base.spectralWeight)
+                return (deviationDB - globalGain, observationWeight(observation, in: observations, weights: weights))
             }
         )
         let frameErrors = makeFrameErrors(
             observations: ranking,
             definitions: definitions,
-            globalGain: globalGain
+            globalGain: globalGain,
+            weights: weights
         )
         // P90 uses the same compressed frame-energy weights as the match. A
         // tail of near-silent frames therefore cannot dominate the percentile.
@@ -407,7 +657,7 @@ public struct PersonalMatcher: Sendable {
         if support.lowerHz > 20 || rankingUpper < 20_000 {
             limitations.append("排名仅使用共同支持范围 \(formatHz(support.lowerHz))–\(formatHz(rankingUpper)) Hz。")
         }
-        if responseObservations.contains(where: { $0.base.energy > $0.responseEnergy * 1.000001 }) {
+        if observations.contains(where: { $0.base.energy > $0.responseEnergy * 1.000001 }) {
             limitations.append("部分频带的 PSD 没有对应的完整曲线插值，结果使用可用交集。")
         }
         let status: PersonalReferenceMatch.Status = commonLimitations.contains { $0.contains("覆盖") }
@@ -426,11 +676,12 @@ public struct PersonalMatcher: Sendable {
             evaluatedMinHz: support.lowerHz,
             evaluatedMaxHz: rankingUpper,
             status: status,
-            frequencyEvidence: makeBandEvidence(
-                definitions: definitions,
-                plans: prepared.plans,
-                observations: responseObservations,
-                globalGain: globalGain,
+                frequencyEvidence: makeBandEvidence(
+                    definitions: definitions,
+                    plans: prepared.plans,
+                    observations: observations,
+                    weights: weights,
+                    globalGain: globalGain,
                 totalAllEnergy: prepared.totalAllEnergy,
                 support: support
             ),
@@ -446,6 +697,7 @@ public struct PersonalMatcher: Sendable {
         headphoneCurve: Curve
     ) -> PreparedBands {
         let frequencies = features.frequencyBinsHz
+        let cellEdges = validatedCellEdges(features)
         let plans = definitions.map { definition in
             let overlaps = frequencies.indices.compactMap { index -> BinOverlap? in
                 let frequency = frequencies[index]
@@ -465,9 +717,20 @@ public struct PersonalMatcher: Sendable {
                     frequencies: frequencies,
                     index: index,
                     lower: lower,
-                    upper: upper
+                    upper: upper,
+                    cellEdges: cellEdges
                 )
                 return width > 0 ? BinOverlap(index: index, widthHz: width) : nil
+            }
+            let resolutionWidth: Double
+            if cellEdges == nil {
+                // Keep the native nil-edges diagnostic unchanged. Compact
+                // input below uses its actual variable cell widths.
+                resolutionWidth = features.sampleRate / Double(features.parameters.frameLength)
+            } else {
+                resolutionWidth = overlaps
+                    .map { cellWidth(frequencies: frequencies, index: $0.index, cellEdges: cellEdges) }
+                    .max() ?? 0
             }
             return BandPlan(
                 definition: definition,
@@ -475,7 +738,7 @@ public struct PersonalMatcher: Sendable {
                 isRankingBand: definition.lowerHz < 20_000 && definition.upperHz > 20,
                 resolutionLimited: max(0, min(support.upperHz, definition.upperHz) - max(support.lowerHz, definition.lowerHz)) > 0 &&
                     max(0, min(support.upperHz, definition.upperHz) - max(support.lowerHz, definition.lowerHz)) <
-                    features.sampleRate / Double(features.parameters.frameLength)
+                    resolutionWidth
             )
         }
         var raw: [(frame: Int, start: Double, band: Int, channel: Int, energy: Double)] = []
@@ -497,49 +760,19 @@ public struct PersonalMatcher: Sendable {
         }
         let totalMainEnergy = mainFrameEnergy.reduce(0, +)
         let totalAllEnergy = raw.reduce(0) { $0 + $1.energy }
-        var frameSpectralWeightSum = Array(repeating: 0.0, count: features.frames.count)
-        if totalMainEnergy > 0 {
-            for value in raw where plans[value.band].isRankingBand {
-                let frameEnergy = mainFrameEnergy[value.frame]
-                if frameEnergy > 0, value.energy > 0 {
-                    frameSpectralWeightSum[value.frame] += pow(value.energy / frameEnergy, configuration.compressionExponent)
-                }
-            }
-        }
-        var observations: [BandBaseObservation] = []
-        observations.reserveCapacity(raw.count)
-        for value in raw {
-            let frameEnergy = mainFrameEnergy[value.frame]
-            let frameWeight = totalMainEnergy > 0 && frameEnergy > 0
-                ? pow(frameEnergy / totalMainEnergy, configuration.compressionExponent)
-                : 0
-            let rawSpectralWeight = frameEnergy > 0 && value.energy > 0
-                ? pow(value.energy / frameEnergy, configuration.compressionExponent)
-                : 0
-            let spectralWeight: Double
-            if plans[value.band].isRankingBand {
-                let normalizer = frameSpectralWeightSum[value.frame]
-                spectralWeight = normalizer > 0 ? rawSpectralWeight / normalizer : 0
-            } else {
-                // Extended bands may be shown as evidence, but never enter
-                // the 20 Hz–20 kHz frame spectral normalizer.
-                spectralWeight = rawSpectralWeight
-            }
-            observations.append(
-                BandBaseObservation(
-                    frameIndex: value.frame,
-                    startTimeSeconds: value.start,
-                    bandIndex: value.band,
-                    channelIndex: value.channel,
-                    energy: value.energy,
-                    frameWeight: frameWeight,
-                    spectralWeight: spectralWeight
-                )
+        let observations: [BandBaseObservation] = raw.map { value in
+            BandBaseObservation(
+                frameIndex: value.frame,
+                startTimeSeconds: value.start,
+                bandIndex: value.band,
+                channelIndex: value.channel,
+                energy: value.energy
             )
         }
         return PreparedBands(
             plans: plans,
             observations: observations,
+            frameMainEnergies: mainFrameEnergy,
             totalMainEnergy: totalMainEnergy,
             totalAllEnergy: totalAllEnergy,
             headphoneValues: makeHeadphoneResponseCache(
@@ -581,12 +814,12 @@ public struct PersonalMatcher: Sendable {
 
         var result: [ReferenceBandObservation] = []
         result.reserveCapacity(prepared.observations.count)
-        for base in prepared.observations {
+        for (observationIndex, base) in prepared.observations.enumerated() {
             let plan = prepared.plans[base.bandIndex]
             var responseEnergy = 0.0
             var responsePower = 0.0
             guard !headphoneValues.isEmpty else {
-                result.append(ReferenceBandObservation(base: base, deviationDB: nil, responseEnergy: 0))
+                result.append(ReferenceBandObservation(index: observationIndex, base: base, deviationDB: nil, responseEnergy: 0))
                 continue
             }
             let channel = min(base.channelIndex, headphoneValues.count - 1)
@@ -607,6 +840,7 @@ public struct PersonalMatcher: Sendable {
             }
             result.append(
                 ReferenceBandObservation(
+                    index: observationIndex,
                     base: base,
                     deviationDB: deviation,
                     responseEnergy: responseEnergy
@@ -616,10 +850,68 @@ public struct PersonalMatcher: Sendable {
         return result
     }
 
+    /// Derives the two independent weighting vectors from the already
+    /// integrated band energies. It never rereads PSD or interpolates a
+    /// headphone/reference curve, which keeps sensitivity diagnostics cheap.
+    private func makeWeightPlan(
+        prepared: PreparedBands,
+        spectralExponent: Double,
+        temporalExponent: Double
+    ) -> WeightPlan {
+        guard spectralExponent.isFinite, spectralExponent > 0, spectralExponent <= 1,
+              temporalExponent.isFinite, temporalExponent >= 0, temporalExponent <= 1 else {
+            return WeightPlan(
+                frameWeights: Array(repeating: 0, count: prepared.frameMainEnergies.count),
+                spectralWeights: Array(repeating: 0, count: prepared.observations.count)
+            )
+        }
+
+        var spectralNormalizers = Array(repeating: 0.0, count: prepared.frameMainEnergies.count)
+        for observation in prepared.observations {
+            let plan = prepared.plans[observation.bandIndex]
+            let frameEnergy = prepared.frameMainEnergies[observation.frameIndex]
+            guard plan.isRankingBand, frameEnergy > 0, observation.energy > 0 else { continue }
+            spectralNormalizers[observation.frameIndex] += pow(observation.energy / frameEnergy, spectralExponent)
+        }
+
+        let frameWeights = prepared.frameMainEnergies.map { frameEnergy in
+            guard prepared.totalMainEnergy > 0, frameEnergy > 0 else { return 0.0 }
+            // temporalExponent == 0 deliberately means equal weight for each
+            // non-zero frame; zero-energy frames remain excluded.
+            return pow(frameEnergy / prepared.totalMainEnergy, temporalExponent)
+        }
+        let spectralWeights = prepared.observations.map { observation in
+            let plan = prepared.plans[observation.bandIndex]
+            let frameEnergy = prepared.frameMainEnergies[observation.frameIndex]
+            guard frameEnergy > 0, observation.energy > 0 else { return 0.0 }
+            let raw = pow(observation.energy / frameEnergy, spectralExponent)
+            guard raw.isFinite, raw > 0 else { return 0.0 }
+            if plan.isRankingBand {
+                let normalizer = spectralNormalizers[observation.frameIndex]
+                return normalizer > 0 ? raw / normalizer : 0.0
+            }
+            // Extended bands may be shown as evidence, but never enter the
+            // 20 Hz–20 kHz frame spectral normalizer.
+            return raw
+        }
+        return WeightPlan(frameWeights: frameWeights, spectralWeights: spectralWeights)
+    }
+
+    private func observationWeight(
+        _ observation: ReferenceBandObservation,
+        in allObservations: [ReferenceBandObservation],
+        weights: WeightPlan
+    ) -> Double {
+        guard observation.index >= 0 && observation.index < allObservations.count else { return 0 }
+        let base = allObservations[observation.index].base
+        return weights.frameWeight(for: base) * weights.spectralWeight(for: observation.index)
+    }
+
     private func makeBandEvidence(
         definitions: [BandDefinition],
         plans: [BandPlan],
         observations: [ReferenceBandObservation],
+        weights: WeightPlan,
         globalGain: Double?,
         totalAllEnergy: Double,
         support: CommonSupport
@@ -651,12 +943,14 @@ public struct PersonalMatcher: Sendable {
             let peakTime = peakFrame.flatMap { frame in
                 bandObservations.first(where: { $0.base.frameIndex == frame })?.base.startTimeSeconds
             }
-            let bandWeight = bandObservations.reduce(0) { $0 + $1.base.frameWeight * $1.base.spectralWeight }
+            let bandWeight = bandObservations.reduce(0) {
+                $0 + observationWeight($1, in: observations, weights: weights)
+            }
             let deviation = globalGain.flatMap { gain in
                 weightedRMS(
                     bandObservations.compactMap { observation in
                         guard let value = observation.deviationDB else { return nil }
-                        return (value - gain, observation.base.frameWeight * observation.base.spectralWeight)
+                        return (value - gain, observationWeight(observation, in: observations, weights: weights))
                     }
                 )
             }
@@ -776,22 +1070,23 @@ public struct PersonalMatcher: Sendable {
     private func makeFrameErrors(
         observations: [ReferenceBandObservation],
         definitions: [BandDefinition],
-        globalGain: Double
+        globalGain: Double,
+        weights: WeightPlan
     ) -> [FrameError] {
         let grouped = Dictionary(grouping: observations) { $0.base.frameIndex }
         return grouped.compactMap { _, values in
             let main = values.filter { definitions[$0.base.bandIndex].isRankingBand }
             let error = weightedRMS(
                 main.compactMap { observation in
-                    guard let value = observation.deviationDB else { return nil }
-                    return (value - globalGain, observation.base.spectralWeight)
+                guard let value = observation.deviationDB else { return nil }
+                    return (value - globalGain, weights.spectralWeight(for: observation.index))
                 }
             )
             guard let first = values.first, let error else { return nil }
             return FrameError(
                 startTimeSeconds: first.base.startTimeSeconds,
                 errorDB: error,
-                weight: first.base.frameWeight
+                weight: weights.frameWeight(for: first.base)
             )
         }.sorted { $0.startTimeSeconds < $1.startTimeSeconds }
     }
@@ -828,7 +1123,8 @@ public struct PersonalMatcher: Sendable {
         guard features.channelCount > 0,
               features.frequencyBinsHz.count >= 2,
               features.frequencyBinsHz.allSatisfy(\.isFinite),
-              zip(features.frequencyBinsHz, features.frequencyBinsHz.dropFirst()).allSatisfy({ $0.0 < $0.1 }) else {
+              zip(features.frequencyBinsHz, features.frequencyBinsHz.dropFirst()).allSatisfy({ $0.0 < $0.1 }),
+              validCellEdges(features) else {
             return false
         }
         return features.frames.allSatisfy { frame in
@@ -837,6 +1133,26 @@ public struct PersonalMatcher: Sendable {
                     $0.count == features.frequencyBinsHz.count && $0.allSatisfy { $0.isFinite && $0 >= 0 }
                 }
         }
+    }
+
+    private func validCellEdges(_ features: SpectrumFeatures) -> Bool {
+        if features.compactStorage != nil, features.frequencyCellEdgesHz == nil { return false }
+        guard features.frequencyCellEdgesHz != nil else { return true }
+        return validatedCellEdges(features) != nil
+    }
+
+    private func validatedCellEdges(_ features: SpectrumFeatures) -> [Double]? {
+        guard let edges = features.frequencyCellEdgesHz else { return nil }
+        let frequencies = features.frequencyBinsHz
+        guard edges.count == frequencies.count + 1,
+              edges.allSatisfy(\.isFinite),
+              zip(edges, edges.dropFirst()).allSatisfy({ $0.0 < $0.1 }),
+              frequencies.indices.allSatisfy({ index in
+                  edges[index] <= frequencies[index] && frequencies[index] <= edges[index + 1]
+              }) else {
+            return nil
+        }
+        return edges
     }
 
     private func baseLimitations(features: SpectrumFeatures, references: [Curve]) -> [String] {
@@ -850,9 +1166,24 @@ public struct PersonalMatcher: Sendable {
         if references.count > 1 {
             result.append("每条参考曲线独立计算整曲偏差，最佳项不会由不同参考的频段拼接。")
         }
-        result.append("频谱权重是归一化逐带功率的 \(configuration.compressionExponent) 次压缩启发式，不是 ISO 响度或听阈模型。")
-        result.append("最差片段时间表示非零帧的谱形差异，不是可听性判断。")
+        if features.compactStorage != nil {
+            result.append(Self.compactApproximationLimitation)
+            if features.frequencyValidity == .mathematicalNyquist {
+                result.append("频率上限仍只是 PCM 的数学 Nyquist，不证明对应频段含有实测内容")
+            }
+        }
+        result.append("频谱权重是归一化逐带功率的 \(configuration.compressionExponent) 次压缩启发式；帧活动权重是非零帧能量的 \(configuration.temporalExponent) 次压缩启发式，二者都不是 ISO 响度或听阈模型。")
+        result.append("最差片段时间表示非零帧的谱形差异，不是可听性判断；帧活动权重也不是心理声学时间积分。")
         return result
+    }
+
+    private static let compactApproximationLimitation =
+        "compact 频谱按 cell 内 PSD 密度积分后以中心频率近似曲线权重；高 Q 峰、峰位与 20 kHz 边界可能改变，不能视为无损或与原始逐频率结果数学等价"
+
+    private func resultModelVersion(for features: SpectrumFeatures) -> String {
+        features.compactStorage == nil
+            ? Self.modelVersion
+            : Self.modelVersion + "-compact-v1"
     }
 
     private func unavailableMatch(reference: Curve, limitations: [String]) -> PersonalReferenceMatch {
@@ -884,13 +1215,41 @@ public struct PersonalMatcher: Sendable {
         }
     }
 
-    private func cellOverlapWidth(frequencies: [Double], index: Int, lower: Double, upper: Double) -> Double {
+    private func cellWidth(frequencies: [Double], index: Int, cellEdges: [Double]?) -> Double {
+        if let cellEdges {
+            let width = cellEdges[index + 1] - cellEdges[index]
+            return width.isFinite && width > 0 ? width : 0
+        }
         let cellLower = index == frequencies.startIndex
             ? frequencies[index]
             : (frequencies[index - 1] + frequencies[index]) / 2
         let cellUpper = index == frequencies.index(before: frequencies.endIndex)
             ? frequencies[index]
             : (frequencies[index] + frequencies[index + 1]) / 2
+        let width = cellUpper - cellLower
+        return width.isFinite && width > 0 ? width : 0
+    }
+
+    private func cellOverlapWidth(
+        frequencies: [Double],
+        index: Int,
+        lower: Double,
+        upper: Double,
+        cellEdges: [Double]?
+    ) -> Double {
+        let cellLower: Double
+        let cellUpper: Double
+        if let cellEdges {
+            cellLower = cellEdges[index]
+            cellUpper = cellEdges[index + 1]
+        } else {
+            cellLower = index == frequencies.startIndex
+                ? frequencies[index]
+                : (frequencies[index - 1] + frequencies[index]) / 2
+            cellUpper = index == frequencies.index(before: frequencies.endIndex)
+                ? frequencies[index]
+                : (frequencies[index] + frequencies[index + 1]) / 2
+        }
         let overlap = min(cellUpper, upper) - max(cellLower, lower)
         return overlap.isFinite && overlap > 0 ? overlap : 0
     }

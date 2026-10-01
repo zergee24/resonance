@@ -6,6 +6,35 @@ import Foundation
 /// the source audio. The public feature artifact keeps the source sample rate,
 /// channel separation, frequency bins and every analyzed frame.
 public struct SpectrumAnalyzer: Sendable {
+    fileprivate struct FileStreamDescriptor {
+        let sampleRate: Double
+        let channelCount: Int
+        let frequencyBinsHz: [Double]
+        let durationSeconds: Double
+        let format: AudioFormatMetadata
+        let parameters: SpectrumAnalysisParameters
+    }
+
+    /// Read-only information used by recording analysis to decide whether a
+    /// PCM segment can produce at least one native analysis window.  This is
+    /// deliberately based on the same configuration calculation as `analyze`
+    /// and does not decode or alter the source audio.
+    public struct InputEligibility: Sendable, Equatable {
+        public let sampleCount: Int64
+        public let sampleRate: Double
+        public let requiredFrameLength: Int
+
+        public var hasSpectrumFrame: Bool {
+            sampleCount >= Int64(requiredFrameLength)
+        }
+
+        public init(sampleCount: Int64, sampleRate: Double, requiredFrameLength: Int) {
+            self.sampleCount = sampleCount
+            self.sampleRate = sampleRate
+            self.requiredFrameLength = requiredFrameLength
+        }
+    }
+
     public struct Configuration: Codable, Sendable, Equatable {
         public let frameDurationSeconds: Double
         public let hopFraction: Double
@@ -59,6 +88,28 @@ public struct SpectrumAnalyzer: Sendable {
         self.configuration = configuration
     }
 
+    /// Reads only the audio container metadata needed for the minimum-frame
+    /// decision. It intentionally throws for empty or malformed audio so a
+    /// corrupt file is not mislabeled as an ordinary short segment.
+    public func inputEligibility(fileURL: URL) throws -> InputEligibility {
+        let file = try AVAudioFile(forReading: fileURL)
+        let format = file.processingFormat
+        let sampleRate = format.sampleRate
+        let channelCount = format.channelCount
+        guard sampleRate.isFinite, sampleRate > 0, channelCount > 0 else {
+            throw ResonanceCoreError.invalidAudioFormat
+        }
+        guard file.length > 0 else {
+            throw ResonanceCoreError.emptyAudio
+        }
+        let parameters = try configuration.parameters(sampleRate: sampleRate)
+        return InputEligibility(
+            sampleCount: Int64(file.length),
+            sampleRate: sampleRate,
+            requiredFrameLength: parameters.frameLength
+        )
+    }
+
     /// Decodes a local audio file through AVAudioFile using the source sample
     /// rate and channel count. Decoding changes the sample representation to
     /// non-interleaved Float32 only; it does not downmix or resample.
@@ -67,13 +118,192 @@ public struct SpectrumAnalyzer: Sendable {
         coverage: Coverage = .unknown,
         recordingID: UUID? = nil
     ) throws -> SpectrumFeatures {
-        let decoded = try decode(fileURL: fileURL)
-        return try analyze(
-            samples: decoded.samples,
-            sampleRate: decoded.sampleRate,
-            coverage: coverage,
+        var frames: [SpectrumFrame] = []
+        let stream = try streamFileFrames(
+            fileURL: fileURL,
+            onStart: { _ in },
+            onFrame: { frames.append($0) }
+        )
+        return SpectrumFeatures(
             recordingID: recordingID,
-            format: decoded.format
+            sampleRate: stream.sampleRate,
+            channelCount: stream.channelCount,
+            frequencyBinsHz: stream.frequencyBinsHz,
+            frames: frames,
+            durationSeconds: stream.durationSeconds,
+            coverage: coverage,
+            validMinHz: stream.frequencyBinsHz.first ?? 0,
+            validMaxHz: stream.frequencyBinsHz.last ?? stream.sampleRate / 2,
+            frequencyValidity: .mathematicalNyquist,
+            format: stream.format,
+            parameters: stream.parameters,
+            analyzerVersion: "1-hann-psd"
+        )
+    }
+
+    /// Decodes and aggregates a file one native FFT frame at a time. The
+    /// native frame generator is shared with `analyze(fileURL:)`, so compact
+    /// analysis does not first materialize a full-track native PSD artifact.
+    public func analyzeCompact(
+        fileURL: URL,
+        coverage: Coverage = .unknown,
+        recordingID: UUID? = nil,
+        bandsPerOctave: Int = CompactSpectrum.defaultBandsPerOctave
+    ) throws -> SpectrumFeatures {
+        var accumulator: CompactSpectrum.Accumulator?
+        let stream = try streamFileFrames(
+            fileURL: fileURL,
+            onStart: { descriptor in
+                accumulator = try CompactSpectrum.Accumulator(
+                    frequencyBinsHz: descriptor.frequencyBinsHz,
+                    channelCount: descriptor.channelCount,
+                    bandsPerOctave: bandsPerOctave
+                )
+            },
+            onFrame: { frame in
+                try accumulator?.append(frame)
+            }
+        )
+        guard let accumulator else {
+            throw CompactSpectrumError.invalidFrequencyGrid
+        }
+        return try accumulator.finish(
+            recordingID: recordingID,
+            sampleRate: stream.sampleRate,
+            durationSeconds: stream.durationSeconds,
+            coverage: coverage,
+            validMinHz: stream.frequencyBinsHz.first ?? 0,
+            validMaxHz: stream.frequencyBinsHz.last ?? stream.sampleRate / 2,
+            frequencyValidity: .mathematicalNyquist,
+            format: stream.format,
+            parameters: stream.parameters,
+            sourceAnalyzerVersion: "1-hann-psd"
+        )
+    }
+
+    fileprivate func streamFileFrames(
+        fileURL: URL,
+        onStart: (FileStreamDescriptor) throws -> Void,
+        onFrame: (SpectrumFrame) throws -> Void
+    ) throws -> FileStreamDescriptor {
+        // Keep file analysis bounded to one decoder block plus the overlap
+        // needed by the next native FFT window. The caller owns only the
+        // compact or native frames it explicitly chooses to retain.
+        let file = try AVAudioFile(forReading: fileURL, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let processingFormat = file.processingFormat
+        let sampleRate = processingFormat.sampleRate
+        let channelCount = Int(processingFormat.channelCount)
+        guard sampleRate.isFinite, sampleRate > 0, channelCount > 0 else {
+            throw ResonanceCoreError.invalidAudioFormat
+        }
+
+        let parameters = try configuration.parameters(sampleRate: sampleRate)
+        guard file.length > 0 else { throw ResonanceCoreError.emptyAudio }
+        guard file.length <= Int64(Int.max) else { throw ResonanceCoreError.invalidAudioFormat }
+
+        let context = try makeAnalysisContext(sampleRate: sampleRate, parameters: parameters)
+        let descriptor = FileStreamDescriptor(
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            frequencyBinsHz: context.frequencyBins,
+            durationSeconds: 0,
+            format: AudioFormatMetadata(
+                sampleRate: sampleRate,
+                channelCount: channelCount,
+                sampleFormat: .float32,
+                interleaved: false
+            ),
+            parameters: parameters
+        )
+        try onStart(descriptor)
+        let chunkCapacity: AVAudioFrameCount = 65_536
+        var remainingFrames = file.length
+        var decodedFrameCount: Int64 = 0
+        var bufferedStart = 0
+        var nextFrameStart = 0
+        var channels = Array(repeating: [Float](), count: channelCount)
+
+        while remainingFrames > 0 {
+            try Task.checkCancellation()
+            var reachedShortRead = false
+            try autoreleasepool {
+                let requestedFrames = AVAudioFrameCount(min(Int64(chunkCapacity), remainingFrames))
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: requestedFrames) else {
+                    throw ResonanceCoreError.invalidAudioFormat
+                }
+                // Bound each request by the advertised file length. A short
+                // final read is treated as the end of the readable container,
+                // matching AVAudioFile's prior decode behavior.
+                try file.read(into: buffer, frameCount: requestedFrames)
+                let frameCount = Int(buffer.frameLength)
+                if frameCount == 0 {
+                    // Match the prior decoder's EOF behavior: a zero-frame
+                    // read ends decoding, and the normal empty/no-frame
+                    // checks below classify the accumulated samples.
+                    reachedShortRead = true
+                    return
+                }
+                guard let channelData = buffer.floatChannelData else {
+                    throw ResonanceCoreError.unsupportedAudioFormat
+                }
+                for channel in 0..<channelCount {
+                    let values = UnsafeBufferPointer(start: channelData[channel], count: frameCount)
+                    // Validate every decoded sample, including samples that
+                    // remain in the final incomplete FFT window. Otherwise a
+                    // NaN/Inf in the tail could be missed by frame processing.
+                    guard values.allSatisfy({ $0.isFinite }) else {
+                        throw ResonanceCoreError.nonFiniteAudioSample
+                    }
+                    channels[channel].append(contentsOf: values)
+                }
+
+                decodedFrameCount += Int64(frameCount)
+                remainingFrames -= Int64(frameCount)
+                reachedShortRead = frameCount < Int(requestedFrames)
+
+                while decodedFrameCount - Int64(nextFrameStart) >= Int64(parameters.frameLength) {
+                    try Task.checkCancellation()
+                    let localFrameStart = nextFrameStart - bufferedStart
+                    let frameChannels = channels.map {
+                        Array($0[localFrameStart..<(localFrameStart + parameters.frameLength)])
+                    }
+                    try onFrame(makeSpectrumFrame(
+                        channels: frameChannels,
+                        sampleStart: 0,
+                        timestampFrameStart: nextFrameStart,
+                        sampleRate: sampleRate,
+                        context: context
+                    ))
+                    nextFrameStart += parameters.hopLength
+
+                    // Retain only the overlap/tail needed for the next frame.
+                    // removeFirst keeps the working set bounded without making
+                    // a second full-track copy during compaction.
+                    let discardCount = nextFrameStart - bufferedStart
+                    if discardCount >= Int(chunkCapacity) {
+                        for channel in channels.indices {
+                            channels[channel].removeFirst(discardCount)
+                        }
+                        bufferedStart = nextFrameStart
+                    }
+                }
+            }
+            if reachedShortRead {
+                // Do not probe beyond a short final block.
+                remainingFrames = 0
+            }
+        }
+
+        guard decodedFrameCount > 0 else { throw ResonanceCoreError.emptyAudio }
+        guard nextFrameStart > 0 else { throw ResonanceCoreError.noSpectrumFrames }
+
+        return FileStreamDescriptor(
+            sampleRate: descriptor.sampleRate,
+            channelCount: descriptor.channelCount,
+            frequencyBinsHz: descriptor.frequencyBinsHz,
+            durationSeconds: Double(decodedFrameCount) / sampleRate,
+            format: descriptor.format,
+            parameters: descriptor.parameters
         )
     }
 
@@ -126,51 +356,20 @@ public struct SpectrumAnalyzer: Sendable {
             throw ResonanceCoreError.noSpectrumFrames
         }
 
-        let window = hannWindow(length: parameters.frameLength)
-        let windowPower = window.reduce(0.0) { $0 + $1 * $1 }
-        guard windowPower.isFinite, windowPower > 0 else {
-            throw ResonanceCoreError.invalidAnalysisParameters
-        }
-
-        let binCount = parameters.frameLength / 2 + 1
-        let frequencyBins = (0..<binCount).map {
-            Double($0) * sampleRate / Double(parameters.frameLength)
-        }
+        let context = try makeAnalysisContext(sampleRate: sampleRate, parameters: parameters)
         var frames: [SpectrumFrame] = []
         frames.reserveCapacity(1 + (sampleCount - parameters.frameLength) / parameters.hopLength)
 
         var frameStart = 0
         while frameStart + parameters.frameLength <= sampleCount {
-            var channelPSDs: [[Double]] = []
-            channelPSDs.reserveCapacity(samples.count)
-
-            for channel in samples {
-                var real = Array(repeating: 0.0, count: parameters.frameLength)
-                for index in 0..<parameters.frameLength {
-                    let value = Double(channel[frameStart + index])
-                    real[index] = value * window[index]
-                }
-                let (fftReal, fftImaginary) = acceleratedRealFFT(real)
-                var psd = Array(repeating: 0.0, count: binCount)
-                let denominator = sampleRate * windowPower
-                for bin in 0..<binCount {
-                    let magnitudeSquared = fftReal[bin] * fftReal[bin] + fftImaginary[bin] * fftImaginary[bin]
-                    var value = magnitudeSquared / denominator
-                    if bin != 0 && bin != parameters.frameLength / 2 {
-                        value *= 2.0
-                    }
-                    psd[bin] = value.isFinite && value >= 0 ? value : 0
-                }
-                channelPSDs.append(psd)
-            }
-
-            frames.append(
-                SpectrumFrame(
-                    startTimeSeconds: Double(frameStart) / sampleRate,
-                    sampleCount: parameters.frameLength,
-                    powerSpectralDensityByChannel: channelPSDs
-                )
-            )
+            try Task.checkCancellation()
+            frames.append(makeSpectrumFrame(
+                channels: samples,
+                sampleStart: frameStart,
+                timestampFrameStart: frameStart,
+                sampleRate: sampleRate,
+                context: context
+            ))
             frameStart += parameters.hopLength
         }
 
@@ -181,15 +380,15 @@ public struct SpectrumAnalyzer: Sendable {
             recordingID: recordingID,
             sampleRate: sampleRate,
             channelCount: samples.count,
-            frequencyBinsHz: frequencyBins,
+            frequencyBinsHz: context.frequencyBins,
             frames: frames,
             durationSeconds: duration,
             // An audio file's byte range does not prove its media coverage or
             // identity. Keep unknown as unknown so Matcher cannot award a
             // result until the caller supplies complete/partial coverage.
             coverage: coverage,
-            validMinHz: frequencyBins.first ?? 0,
-            validMaxHz: frequencyBins.last ?? sampleRate / 2,
+            validMinHz: context.frequencyBins.first ?? 0,
+            validMaxHz: context.frequencyBins.last ?? sampleRate / 2,
             frequencyValidity: .mathematicalNyquist,
             format: format,
             parameters: parameters,
@@ -197,62 +396,68 @@ public struct SpectrumAnalyzer: Sendable {
         )
     }
 
-    private struct DecodedAudio {
-        let samples: [[Float]]
-        let sampleRate: Double
-        let format: AudioFormatMetadata
+    private struct AnalysisContext {
+        let window: [Double]
+        let windowPower: Double
+        let binCount: Int
+        let frequencyBins: [Double]
+        let parameters: SpectrumAnalysisParameters
     }
 
-    private func decode(fileURL: URL) throws -> DecodedAudio {
-        // This initializer requests Float32/non-interleaved output while
-        // keeping the file's native sample rate and channel count.
-        let file = try AVAudioFile(forReading: fileURL, commonFormat: .pcmFormatFloat32, interleaved: false)
-        let processingFormat = file.processingFormat
-        let sampleRate = processingFormat.sampleRate
-        let channelCount = Int(processingFormat.channelCount)
-        guard sampleRate.isFinite, sampleRate > 0, channelCount > 0 else {
-            throw ResonanceCoreError.invalidAudioFormat
+    private func makeAnalysisContext(
+        sampleRate: Double,
+        parameters: SpectrumAnalysisParameters
+    ) throws -> AnalysisContext {
+        let window = hannWindow(length: parameters.frameLength)
+        let windowPower = window.reduce(0.0) { $0 + $1 * $1 }
+        guard windowPower.isFinite, windowPower > 0 else {
+            throw ResonanceCoreError.invalidAnalysisParameters
         }
+        let binCount = parameters.frameLength / 2 + 1
+        let frequencyBins = (0..<binCount).map {
+            Double($0) * sampleRate / Double(parameters.frameLength)
+        }
+        return AnalysisContext(
+            window: window,
+            windowPower: windowPower,
+            binCount: binCount,
+            frequencyBins: frequencyBins,
+            parameters: parameters
+        )
+    }
 
-        var channels = Array(repeating: [Float](), count: channelCount)
-        let chunkCapacity: AVAudioFrameCount = 65_536
-        var remainingFrames = file.length
-        while remainingFrames > 0 {
-            let requestedFrames = AVAudioFrameCount(min(Int64(chunkCapacity), remainingFrames))
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: requestedFrames) else {
-                throw ResonanceCoreError.invalidAudioFormat
+    private func makeSpectrumFrame(
+        channels: [[Float]],
+        sampleStart: Int,
+        timestampFrameStart: Int,
+        sampleRate: Double,
+        context: AnalysisContext
+    ) -> SpectrumFrame {
+        var channelPSDs: [[Double]] = []
+        channelPSDs.reserveCapacity(channels.count)
+        for channel in channels {
+            var real = Array(repeating: 0.0, count: context.parameters.frameLength)
+            for index in 0..<context.parameters.frameLength {
+                let value = Double(channel[sampleStart + index])
+                real[index] = value * context.window[index]
             }
-            // AVAudioFile can throw Foundation._GenericObjCError(nilError)
-            // when an exact chunk-aligned file is read once more at EOF.
-            // Bound each request by the advertised file length so the final
-            // full chunk terminates the loop without probing past the file.
-            try file.read(into: buffer, frameCount: requestedFrames)
-            let frameCount = Int(buffer.frameLength)
-            if frameCount == 0 { break }
-            guard let channelData = buffer.floatChannelData else {
-                throw ResonanceCoreError.unsupportedAudioFormat
+            let (fftReal, fftImaginary) = acceleratedRealFFT(real)
+            var psd = Array(repeating: 0.0, count: context.binCount)
+            let denominator = sampleRate * context.windowPower
+            for bin in 0..<context.binCount {
+                let magnitudeSquared = fftReal[bin] * fftReal[bin] + fftImaginary[bin] * fftImaginary[bin]
+                var value = magnitudeSquared / denominator
+                if bin != 0 && bin != context.parameters.frameLength / 2 {
+                    value *= 2.0
+                }
+                psd[bin] = value.isFinite && value >= 0 ? value : 0
             }
-            for channel in 0..<channelCount {
-                let values = UnsafeBufferPointer(start: channelData[channel], count: frameCount)
-                channels[channel].append(contentsOf: values)
-            }
-            remainingFrames -= AVAudioFramePosition(frameCount)
-            if frameCount < Int(requestedFrames) { break }
+            channelPSDs.append(psd)
         }
-
-        guard let firstCount = channels.first?.count, firstCount > 0,
-              channels.allSatisfy({ $0.count == firstCount }) else {
-            throw ResonanceCoreError.emptyAudio
-        }
-        return DecodedAudio(
-            samples: channels,
-            sampleRate: sampleRate,
-            format: AudioFormatMetadata(
-                sampleRate: sampleRate,
-                channelCount: channelCount,
-                sampleFormat: .float32,
-                interleaved: false
-            )
+        return SpectrumFrame(
+            startTimeSeconds: Double(timestampFrameStart) / sampleRate,
+            sampleCount: context.parameters.frameLength,
+            powerSpectralDensityByChannel: channelPSDs
         )
     }
 }

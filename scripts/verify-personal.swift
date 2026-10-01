@@ -30,6 +30,21 @@ private struct AlphaReport: Codable {
     let bestReferenceID: String?
 }
 
+private struct SensitivityReferenceReport: Codable {
+    let referenceName: String
+    let referenceID: String
+    let overallDB: Double?
+}
+
+private struct SensitivityScenarioReport: Codable {
+    let id: String
+    let spectralExponent: Double
+    let temporalExponent: Double
+    let bestReferenceID: String?
+    let references: [SensitivityReferenceReport]
+    let limitations: [String]
+}
+
 private struct LiveMatchReport: Codable {
     let alpha: Double
     let referenceName: String
@@ -60,6 +75,7 @@ private struct LiveReport: Codable {
     let commonMaximumHz: Double?
     let matches: [LiveMatchReport]
     let alphaSensitivity: [AlphaReport]
+    let sensitivityDiagnostics: [SensitivityScenarioReport]
 }
 
 private struct VerificationReport: Codable {
@@ -254,6 +270,74 @@ private struct PersonalVerification {
         try require(alphaResults.max()! - alphaResults.min()! > 1e-10, "alpha sensitivity is observable")
         passed.append("alpha-0.2-0.3-0.5")
 
+        let legacyConfiguration = PersonalMatcher.Configuration(compressionExponent: 0.3)
+        try require(abs(legacyConfiguration.temporalExponent - 0.3) < 1e-12, "legacy alpha maps to temporal alpha")
+        let baseline = PersonalMatcher(configuration: legacyConfiguration).match(
+            features: features,
+            headphone: headphone,
+            references: [flat, alternate]
+        )
+        let scenarioIDs = baseline.sensitivityDiagnostics.map(\.id)
+        try require(scenarioIDs == ["baseline", "spectral-0.2", "spectral-0.5", "temporal-0", "temporal-1"], "sensitivity scenarios are deduplicated")
+        try require(baseline.sensitivityDiagnostics.allSatisfy { scenario in
+            scenario.limitations.contains(where: { $0.contains("工程情景跨度") })
+        }, "sensitivity scope is explicit")
+        let spectralTwo = try requireScenario(baseline.sensitivityDiagnostics, id: "spectral-0.2")
+        try require(spectralTwo.limitations.contains(where: { $0.contains("频谱权重是归一化逐带功率的 0.2") }), "scenario limitation uses spectral exponent")
+        try require(!spectralTwo.limitations.contains(where: { $0.contains("频谱权重是归一化逐带功率的 0.3") }), "scenario limitation does not reuse baseline spectral exponent")
+        let temporalZero = try requireScenario(baseline.sensitivityDiagnostics, id: "temporal-0")
+        let independentTemporal = PersonalMatcher(configuration: .init(compressionExponent: 0.3, temporalExponent: 0, includeSensitivityDiagnostics: false)).match(
+            features: features,
+            headphone: headphone,
+            references: [flat, alternate]
+        )
+        try require(temporalZero.references.map(\.overallDB) == independentTemporal.matches.map(\.overallDB), "temporal scenario reuses independent configuration result")
+        try require(temporalZero.bestReferenceID == independentTemporal.bestReferenceID, "temporal scenario best reference agrees")
+        let diagnosticsDisabled = PersonalMatcher(configuration: .init(compressionExponent: 0.3, temporalExponent: 0.3, includeSensitivityDiagnostics: false)).match(
+            features: features,
+            headphone: headphone,
+            references: [flat]
+        )
+        try require(diagnosticsDisabled.sensitivityDiagnostics.isEmpty, "sensitivity diagnostics can be disabled")
+        try require(abs((diagnosticsDisabled.matches.first?.overallDB ?? .nan) - (baseline.matches.first?.overallDB ?? .nan)) < 1e-12, "default ranking remains unchanged")
+        passed.append("independent-spectral-temporal-sensitivity")
+
+        let narrowCurve = try curve(id: shapeID, name: "narrow", levels: [0, 0, 6, 0, 0, 0, 0, 0, 0, 0], maximum: 40_000)
+        let narrowHeadphone = Headphone(id: headphone.id, name: "narrow", owned: true, curve: narrowCurve, referenceID: identityID)
+        let narrowFeatures = try narrowBandFeatures()
+        let narrowResult = PersonalMatcher().match(features: narrowFeatures, headphone: narrowHeadphone, references: [flat])
+        try require(narrowResult.matches.first?.bandEvidence.contains(where: { $0.deviationDB != nil && $0.lowerHz <= 1_000 && $0.upperHz > 1_000 }) == true, "low energy narrow band remains observable")
+        passed.append("low-energy-narrow-band-evidence")
+
+        let narrowRight = try curve(id: shapeID, name: "narrow-right", levels: Array(repeating: 0, count: featureFrequencies.count), minimum: 1_000, maximum: 5_000)
+        let disjointRight = try curve(id: shapeID, name: "disjoint-right", levels: Array(repeating: 0, count: featureFrequencies.count), minimum: 30_000, maximum: 40_000)
+        let monoFeatures = try syntheticFeatures(extended: false, coverage: .complete, channelCount: 1)
+        let stereoFeatures = try syntheticFeatures(extended: false, coverage: .complete, channelCount: 2)
+        let monoBaseline = PersonalMatcher(configuration: .init(includeSensitivityDiagnostics: false)).match(features: monoFeatures, headphone: identityHeadphone, references: [flat])
+        for rightCurve in [narrowRight, disjointRight] {
+            let result = PersonalMatcher(configuration: .init(includeSensitivityDiagnostics: false)).match(
+                features: monoFeatures,
+                headphone: Headphone(id: headphone.id, name: "mono-right", owned: true, curve: flat, rightCurve: rightCurve, referenceID: identityID),
+                references: [flat]
+            )
+            try require(result.bestReferenceID == monoBaseline.bestReferenceID, "mono ignores unused right best reference")
+            try require(result.commonMinimumHz == monoBaseline.commonMinimumHz && result.commonMaximumHz == monoBaseline.commonMaximumHz, "mono ignores unused right support")
+            try require(abs((result.matches.first?.overallDB ?? .nan) - (monoBaseline.matches.first?.overallDB ?? .nan)) < 1e-12, "mono ignores unused right overall")
+        }
+        let stereoNarrow = PersonalMatcher(configuration: .init(includeSensitivityDiagnostics: false)).match(
+            features: stereoFeatures,
+            headphone: Headphone(id: headphone.id, name: "stereo-right", owned: true, curve: flat, rightCurve: narrowRight, referenceID: identityID),
+            references: [flat]
+        )
+        try require(abs((stereoNarrow.commonMinimumHz ?? .nan) - 1_000) < 1e-12 && abs((stereoNarrow.commonMaximumHz ?? .nan) - 5_000) < 1e-12, "stereo uses right support")
+        let stereoDisjoint = PersonalMatcher(configuration: .init(includeSensitivityDiagnostics: false)).match(
+            features: stereoFeatures,
+            headphone: Headphone(id: headphone.id, name: "stereo-disjoint-right", owned: true, curve: flat, rightCurve: disjointRight, referenceID: identityID),
+            references: [flat]
+        )
+        try require(stereoDisjoint.bestReferenceID == nil && stereoDisjoint.matches.first?.status == .unavailable, "stereo rejects disjoint right support")
+        passed.append("mono-right-curve-support")
+
         _ = raphael; _ = he1; _ = alter
         return ["synthetic-suite"]
     }
@@ -293,6 +377,18 @@ private struct PersonalVerification {
                 AlphaReport(alpha: alpha, referenceName: match.referenceName, overallDB: match.overallDB, highDB: match.highDB, p90DB: match.frameP90DB, bestReferenceID: result.bestReferenceID?.uuidString)
             })
         }
+        let sensitivityDiagnostics = defaultResult.sensitivityDiagnostics.map { scenario in
+            SensitivityScenarioReport(
+                id: scenario.id,
+                spectralExponent: scenario.spectralExponent,
+                temporalExponent: scenario.temporalExponent,
+                bestReferenceID: scenario.bestReferenceID?.uuidString,
+                references: scenario.references.map { reference in
+                    SensitivityReferenceReport(referenceName: reference.referenceName, referenceID: reference.referenceID.uuidString, overallDB: reference.overallDB)
+                },
+                limitations: scenario.limitations
+            )
+        }
         passed.append("live-benchmark")
         let matches = defaultResult.matches.map { match in
             LiveMatchReport(alpha: 0.3, referenceName: match.referenceName, referenceID: match.referenceID.uuidString, overallDB: match.overallDB, highDB: match.highDB, p90DB: match.frameP90DB, worstFrameDB: match.worstFrameDB, worstFrameTimeSeconds: match.worstFrameTimeSeconds, status: match.status.rawValue)
@@ -303,7 +399,7 @@ private struct PersonalVerification {
             print("LIVE \(match.referenceName) overall=\(format(match.overallDB, digits: 4)) high=\(format(match.highDB, digits: 4)) p90=\(format(match.p90DB, digits: 4)) worstTime=\(format(match.worstFrameTimeSeconds, digits: 3))")
         }
         passed.append("live-classic-matcher")
-        return LiveReport(sourceKind: sourceKind, sourcePath: featurePath, decodeSeconds: decodeSeconds, analysisSeconds: analysisSeconds, matchSeconds: matchSeconds, classicMatchSeconds: classicMatchSeconds, classicDB: classicResult.d, classicC: classicResult.c, classicDHigh: classicResult.dHigh, sampleRate: features.sampleRate, channels: features.channelCount, durationSeconds: features.durationSeconds, frameCount: features.frames.count, commonMinimumHz: defaultResult.commonMinimumHz, commonMaximumHz: defaultResult.commonMaximumHz, matches: matches, alphaSensitivity: alphaSensitivity)
+        return LiveReport(sourceKind: sourceKind, sourcePath: featurePath, decodeSeconds: decodeSeconds, analysisSeconds: analysisSeconds, matchSeconds: matchSeconds, classicMatchSeconds: classicMatchSeconds, classicDB: classicResult.d, classicC: classicResult.c, classicDHigh: classicResult.dHigh, sampleRate: features.sampleRate, channels: features.channelCount, durationSeconds: features.durationSeconds, frameCount: features.frames.count, commonMinimumHz: defaultResult.commonMinimumHz, commonMaximumHz: defaultResult.commonMaximumHz, matches: matches, alphaSensitivity: alphaSensitivity, sensitivityDiagnostics: sensitivityDiagnostics)
     }
 
     private static func readArtifact(_ url: URL) throws -> SpectrumFeatures {
@@ -312,7 +408,7 @@ private struct PersonalVerification {
         return try PropertyListDecoder().decode(SpectrumFeatures.self, from: decoded)
     }
 
-    private static func syntheticFeatures(extended: Bool, coverage: CoverageKind, leftScale: Double = 1, rightScale: Double = 0.8, silence: Bool = false) throws -> SpectrumFeatures {
+    private static func syntheticFeatures(extended: Bool, coverage: CoverageKind, leftScale: Double = 1, rightScale: Double = 0.8, silence: Bool = false, channelCount: Int = 2) throws -> SpectrumFeatures {
         let frequencies = extended ? featureFrequencies : Array(featureFrequencies.prefix(8))
         let base = frequencies.map { frequency -> Double in
             if silence { return 0 }
@@ -323,10 +419,12 @@ private struct PersonalVerification {
         }
         let frames = (0..<3).map { frameIndex in
             let multiplier = frameIndex == 1 ? 1.7 : (frameIndex == 2 ? 0.55 : 1.0)
-            return SpectrumFrame(startTimeSeconds: Double(frameIndex), sampleCount: 1_024, powerSpectralDensityByChannel: [base.map { $0 * multiplier * leftScale }, base.map { $0 * multiplier * rightScale }])
+            let left = base.map { $0 * multiplier * leftScale }
+            let right = base.map { $0 * multiplier * rightScale }
+            return SpectrumFrame(startTimeSeconds: Double(frameIndex), sampleCount: 1_024, powerSpectralDensityByChannel: channelCount == 1 ? [left] : [left, right])
         }
         let coverageValue = try Coverage(kind: coverage, recordedDurationSeconds: coverage == .partial ? 3 : nil, intervals: coverage == .complete ? [try TimeRange(startSeconds: 0, endSeconds: 3)] : [])
-        return SpectrumFeatures(sampleRate: 96_000, channelCount: 2, frequencyBinsHz: frequencies, frames: frames, durationSeconds: 3, coverage: coverageValue, validMinHz: frequencies.first!, validMaxHz: frequencies.last!, frequencyValidity: .mathematicalNyquist, format: AudioFormatMetadata(sampleRate: 96_000, channelCount: 2), parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 1.0 / 48.0))
+        return SpectrumFeatures(sampleRate: 96_000, channelCount: channelCount, frequencyBinsHz: frequencies, frames: frames, durationSeconds: 3, coverage: coverageValue, validMinHz: frequencies.first!, validMaxHz: frequencies.last!, frequencyValidity: .mathematicalNyquist, format: AudioFormatMetadata(sampleRate: 96_000, channelCount: channelCount), parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 1.0 / 48.0))
     }
 
     private static func uniformBandFeatures() throws -> SpectrumFeatures {
@@ -337,9 +435,17 @@ private struct PersonalVerification {
         return SpectrumFeatures(sampleRate: 48_000, channelCount: 2, frequencyBinsHz: frequencies, frames: [frame], durationSeconds: 1, coverage: coverage, validMinHz: 20, validMaxHz: 20_000, frequencyValidity: .measuredContent, format: AudioFormatMetadata(sampleRate: 48_000, channelCount: 2), parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 0.02))
     }
 
-    private static func curve(id: UUID, name: String, levels: [Double], maximum: Double) throws -> Curve {
+    private static func narrowBandFeatures() throws -> SpectrumFeatures {
+        let frequencies = featureFrequencies
+        let powers = frequencies.map { abs($0 - 500) < 0.1 ? 1e-9 : 1.0 }
+        let frame = SpectrumFrame(startTimeSeconds: 0, sampleCount: 1_024, powerSpectralDensityByChannel: [powers, powers])
+        let coverage = try Coverage(kind: .complete, intervals: [try TimeRange(startSeconds: 0, endSeconds: 1)], identityConfirmed: true)
+        return SpectrumFeatures(sampleRate: 96_000, channelCount: 2, frequencyBinsHz: frequencies, frames: [frame], durationSeconds: 1, coverage: coverage, validMinHz: 20, validMaxHz: 40_000, frequencyValidity: .mathematicalNyquist, format: AudioFormatMetadata(sampleRate: 96_000, channelCount: 2), parameters: SpectrumAnalysisParameters(frameLength: 1_024, hopLength: 256, frameDurationSeconds: 1.0 / 96.0))
+    }
+
+    private static func curve(id: UUID, name: String, levels: [Double], minimum: Double = 20, maximum: Double) throws -> Curve {
         let frequencies = levels.count == featureFrequencies.count ? featureFrequencies : Array(featureFrequencies.prefix(levels.count))
-        return try Curve(id: id, name: name, points: zip(frequencies, levels).map { try CurvePoint(frequencyHz: $0.0, decibels: $0.1) }, source: "synthetic", measurementSystem: "synthetic", validMinHz: 20, validMaxHz: maximum, isReference: true)
+        return try Curve(id: id, name: name, points: zip(frequencies, levels).map { try CurvePoint(frequencyHz: $0.0, decibels: $0.1) }, source: "synthetic", measurementSystem: "synthetic", validMinHz: minimum, validMaxHz: maximum, isReference: true)
     }
 
     private static func shift(_ value: Curve, by amount: Double, id: UUID) throws -> Curve {
@@ -349,6 +455,13 @@ private struct PersonalVerification {
     private static func tryValue(_ value: Double?, _ label: String) throws -> Double {
         guard let value, value.isFinite else { throw HarnessFailure(message: "missing finite \(label)") }
         return value
+    }
+
+    private static func requireScenario(_ scenarios: [PersonalSensitivityScenario], id: String) throws -> PersonalSensitivityScenario {
+        guard let scenario = scenarios.first(where: { $0.id == id }) else {
+            throw HarnessFailure(message: "missing sensitivity scenario \(id)")
+        }
+        return scenario
     }
 
     private static func format(_ value: Double?, digits: Int) -> String {

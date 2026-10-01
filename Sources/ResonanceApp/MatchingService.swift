@@ -5,7 +5,8 @@ import UniformTypeIdentifiers
 
 extension AppModel {
     func recompute() {
-        matchTask?.cancel()
+        let previousMatchTask = matchTask
+        previousMatchTask?.cancel()
         results = []; selectedResultID = nil
         spectrumLine = []; spectrumFrequencies = []
         matching = false
@@ -25,8 +26,17 @@ extension AppModel {
         matching = true
         matchTask = Task {
             do {
+                // Cancellation of a detached worker is cooperative. Waiting
+                // for the cancelled outer task before starting the replacement
+                // prevents two large feature artifacts from being decoded and
+                // matched concurrently when the UI triggers rapid recomputes.
+                await previousMatchTask?.value
                 try Task.checkCancellation()
                 let worker = Task.detached(priority: .userInitiated) { () -> ([MatchPresentation], [Double], [Double]) in
+#if MATCHING_MEMORY_VERIFICATION
+                    MatchingMemoryProbe.started()
+                    defer { MatchingMemoryProbe.ended() }
+#endif
                     var presentations: [MatchPresentation] = []
                     var plotX: [Double] = [], plotY: [Double] = []
                     let personalTargets = try personalReferences.map { (library: $0, curve: try Self.coreCurve($0)) }
@@ -46,11 +56,13 @@ extension AppModel {
                             }
                             continue
                         }
+                        try Task.checkCancellation()
                         if currentMode == .song {
                             plotX = features.frequencyBinsHz
                             var sum = Array(repeating: 0.0, count: plotX.count)
                             var validChannelCount = 0
                             for frame in features.frames {
+                                try Task.checkCancellation()
                                 for channel in frame.powerSpectralDensityByChannel {
                                     guard channel.count == plotX.count, channel.allSatisfy(\.isFinite) else { continue }
                                     validChannelCount += 1
@@ -176,9 +188,9 @@ extension AppModel {
             if let bestID = personal.bestReferenceID,
                let best = personal.matches.first(where: { $0.referenceID == bestID }),
                let score = best.overallDeviationDB, score.isFinite {
-                parts.append("个人偏好最佳参考：\(best.referenceName)，整体偏差约 \(String(format: "%.2f", score)) dB。")
+                parts.append("更接近的偏好参考：\(best.referenceName)，整体偏差约 \(String(format: "%.2f", score)) dB；这是参考音色接近度，尚未用个人试听反馈验证喜欢程度。")
             } else {
-                parts.append("个人偏好参考没有可比较的最佳结果。")
+                parts.append("偏好参考没有可比较的结果。")
             }
             if !personal.limitations.isEmpty {
                 parts.append(personal.limitations.prefix(2).joined(separator: "；"))

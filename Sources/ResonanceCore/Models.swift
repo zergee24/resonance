@@ -1,5 +1,16 @@
 import Foundation
 
+public extension CodingUserInfoKey {
+    /// Opts a single encoder into the compact SpectrumFrame representation.
+    /// Decoders recognize compact artifacts automatically.
+    static let resonanceCompactSpectrum: CodingUserInfoKey = {
+        guard let key = CodingUserInfoKey(rawValue: "com.resonance.compactSpectrum") else {
+            preconditionFailure("Unable to create the Resonance compact SpectrumFrame coding key")
+        }
+        return key
+    }()
+}
+
 public enum CurveChannel: String, Codable, Sendable, CaseIterable {
     case mono
     case left
@@ -365,6 +376,21 @@ public struct SpectrumFrame: Codable, Sendable, Equatable {
         case powerSpectralDensityByChannel
         /// Each Data value contains that channel's Float64 values as little-endian bit patterns.
         case powerSpectralDensityByChannelFloat64LE
+        case compactEncodingVersion
+        case compactStepDB
+        case compactChannelCount
+        case compactChannels
+    }
+
+    private static let compactEncodingVersion = 1
+    private static let compactStepDB = 0.01
+    private static let compactMaximumDeltaSteps = 65_534
+
+    private struct CompactChannelPayload: Codable {
+        let count: Int
+        let baseDB: Double?
+        let packedUInt16LE: Data?
+        let fallbackFloat64LE: Data?
     }
 
     public init(from decoder: Decoder) throws {
@@ -372,7 +398,26 @@ public struct SpectrumFrame: Codable, Sendable, Equatable {
         self.startTimeSeconds = try container.decode(Double.self, forKey: .startTimeSeconds)
         self.sampleCount = try container.decode(Int.self, forKey: .sampleCount)
 
-        if container.contains(.powerSpectralDensityByChannelFloat64LE) {
+        let hasCompactMetadata = [
+            CodingKeys.compactEncodingVersion,
+            CodingKeys.compactStepDB,
+            CodingKeys.compactChannelCount,
+            CodingKeys.compactChannels
+        ].contains { container.contains($0) }
+
+        if hasCompactMetadata {
+            guard !container.contains(.powerSpectralDensityByChannel),
+                  !container.contains(.powerSpectralDensityByChannelFloat64LE) else {
+                throw Self.dataCorrupted(
+                    codingPath: container.codingPath,
+                    debugDescription: "SpectrumFrame cannot mix compact and legacy representations"
+                )
+            }
+            self.powerSpectralDensityByChannel = try Self.decodeCompactChannels(
+                from: container,
+                codingPath: container.codingPath
+            )
+        } else if container.contains(.powerSpectralDensityByChannelFloat64LE) {
             let encodedChannels = try container.decode([Data].self, forKey: .powerSpectralDensityByChannelFloat64LE)
             self.powerSpectralDensityByChannel = try Self.decodeFloat64Channels(encodedChannels, codingPath: container.codingPath)
         } else {
@@ -384,10 +429,273 @@ public struct SpectrumFrame: Codable, Sendable, Equatable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(startTimeSeconds, forKey: .startTimeSeconds)
         try container.encode(sampleCount, forKey: .sampleCount)
+
+        if encoder.userInfo[CodingUserInfoKey.resonanceCompactSpectrum] as? Bool == true {
+            let compactChannels = powerSpectralDensityByChannel.map(Self.makeCompactChannel)
+            try container.encode(Self.compactEncodingVersion, forKey: .compactEncodingVersion)
+            try container.encode(Self.compactStepDB, forKey: .compactStepDB)
+            try container.encode(compactChannels.count, forKey: .compactChannelCount)
+            try container.encode(compactChannels, forKey: .compactChannels)
+            return
+        }
+
         try container.encode(
             powerSpectralDensityByChannel.map(Self.encodeFloat64Channel),
             forKey: .powerSpectralDensityByChannelFloat64LE
         )
+    }
+
+    private static func makeCompactChannel(_ channel: [Double]) -> CompactChannelPayload {
+        guard channel.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+            return fallbackCompactChannel(channel)
+        }
+
+        var peakDB: Double?
+        for value in channel where value > 0 {
+            let db = 10.0 * log10(value)
+            guard db.isFinite else {
+                return fallbackCompactChannel(channel)
+            }
+            if let currentPeakDB = peakDB {
+                if db > currentPeakDB {
+                    peakDB = db
+                }
+            } else {
+                peakDB = db
+            }
+        }
+
+        guard let peakDB else {
+            return CompactChannelPayload(
+                count: channel.count,
+                baseDB: 0,
+                packedUInt16LE: encodeUInt16LE(repeatingZeroCount: channel.count),
+                fallbackFloat64LE: nil
+            )
+        }
+
+        var codes = [UInt16]()
+        codes.reserveCapacity(channel.count)
+        for value in channel {
+            guard value > 0 else {
+                codes.append(0)
+                continue
+            }
+
+            let db = 10.0 * log10(value)
+            let deltaSteps = (peakDB - db) / Self.compactStepDB
+            guard deltaSteps.isFinite, deltaSteps >= 0 else {
+                return fallbackCompactChannel(channel)
+            }
+            let roundedSteps = deltaSteps.rounded(.toNearestOrAwayFromZero)
+            guard roundedSteps.isFinite,
+                  roundedSteps >= 0,
+                  roundedSteps <= Double(Self.compactMaximumDeltaSteps),
+                  let integerSteps = Int(exactly: roundedSteps),
+                  integerSteps <= Int(UInt16.max) - 1 else {
+                return fallbackCompactChannel(channel)
+            }
+            codes.append(UInt16(integerSteps + 1))
+        }
+
+        return CompactChannelPayload(
+            count: channel.count,
+            baseDB: peakDB,
+            packedUInt16LE: encodeUInt16LE(codes),
+            fallbackFloat64LE: nil
+        )
+    }
+
+    private static func fallbackCompactChannel(_ channel: [Double]) -> CompactChannelPayload {
+        CompactChannelPayload(
+            count: channel.count,
+            baseDB: nil,
+            packedUInt16LE: nil,
+            fallbackFloat64LE: encodeFloat64Channel(channel)
+        )
+    }
+
+    private static func encodeUInt16LE(_ codes: [UInt16]) -> Data {
+        var data = Data()
+        if codes.count <= Int.max / MemoryLayout<UInt16>.stride {
+            data.reserveCapacity(codes.count * MemoryLayout<UInt16>.stride)
+        }
+        for code in codes {
+            data.append(UInt8(truncatingIfNeeded: code))
+            data.append(UInt8(truncatingIfNeeded: code >> 8))
+        }
+        return data
+    }
+
+    private static func encodeUInt16LE(repeatingZeroCount count: Int) -> Data {
+        var data = Data()
+        if count > 0, count <= Int.max / MemoryLayout<UInt16>.stride {
+            data.reserveCapacity(count * MemoryLayout<UInt16>.stride)
+        }
+        for _ in 0..<count {
+            data.append(0)
+            data.append(0)
+        }
+        return data
+    }
+
+    private static func decodeCompactChannels(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        codingPath: [CodingKey]
+    ) throws -> [[Double]] {
+        let version = try container.decode(Int.self, forKey: .compactEncodingVersion)
+        guard version == Self.compactEncodingVersion else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath + [CodingKeys.compactEncodingVersion],
+                debugDescription: "Unsupported SpectrumFrame compact encoding version " + String(version)
+            )
+        }
+
+        let stepDB = try container.decode(Double.self, forKey: .compactStepDB)
+        guard stepDB.isFinite, stepDB == Self.compactStepDB else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath + [CodingKeys.compactStepDB],
+                debugDescription: "SpectrumFrame compact step must be exactly 0.01 dB"
+            )
+        }
+
+        let channelCount = try container.decode(Int.self, forKey: .compactChannelCount)
+        guard channelCount >= 0 else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath + [CodingKeys.compactChannelCount],
+                debugDescription: "SpectrumFrame compact channel count cannot be negative"
+            )
+        }
+
+        let channels = try container.decode([CompactChannelPayload].self, forKey: .compactChannels)
+        guard channels.count == channelCount else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath + [CodingKeys.compactChannels],
+                debugDescription: "SpectrumFrame compact channel count does not match metadata"
+            )
+        }
+
+        return try channels.enumerated().map { channelIndex, channel in
+            try Self.decodeCompactChannel(
+                channel,
+                stepDB: stepDB,
+                codingPath: codingPath + [CodingKeys.compactChannels, ArrayCodingKey(index: channelIndex)]
+            )
+        }
+    }
+
+    private static func decodeCompactChannel(
+        _ channel: CompactChannelPayload,
+        stepDB: Double,
+        codingPath: [CodingKey]
+    ) throws -> [Double] {
+        guard channel.count >= 0 else {
+            throw Self.dataCorrupted(codingPath: codingPath, debugDescription: "SpectrumFrame compact channel count cannot be negative")
+        }
+
+        let hasPacked = channel.packedUInt16LE != nil
+        let hasFallback = channel.fallbackFloat64LE != nil
+        guard hasPacked != hasFallback else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath,
+                debugDescription: "SpectrumFrame compact channel must contain exactly one representation"
+            )
+        }
+
+        if let packed = channel.packedUInt16LE {
+            guard let baseDB = channel.baseDB, baseDB.isFinite else {
+                throw Self.dataCorrupted(
+                    codingPath: codingPath,
+                    debugDescription: "SpectrumFrame compact packed channel requires a finite base dB"
+                )
+            }
+            let expectedByteCount = try Self.expectedByteCount(
+                count: channel.count,
+                stride: MemoryLayout<UInt16>.stride,
+                codingPath: codingPath
+            )
+            guard packed.count == expectedByteCount else {
+                throw Self.dataCorrupted(
+                    codingPath: codingPath,
+                    debugDescription: "SpectrumFrame compact UInt16 channel length does not match count"
+                )
+            }
+
+            var decoded = [Double]()
+            decoded.reserveCapacity(channel.count)
+            for index in 0..<channel.count {
+                let offset = index * MemoryLayout<UInt16>.stride
+                let code = UInt16(packed[offset]) | (UInt16(packed[offset + 1]) << 8)
+                if code == 0 {
+                    decoded.append(0)
+                    continue
+                }
+
+                let deltaSteps = Int(code) - 1
+                guard deltaSteps <= Self.compactMaximumDeltaSteps else {
+                    throw Self.dataCorrupted(
+                        codingPath: codingPath,
+                        debugDescription: "SpectrumFrame compact UInt16 code exceeds the supported range"
+                    )
+                }
+                let db = baseDB - Double(deltaSteps) * stepDB
+                guard db.isFinite else {
+                    throw Self.dataCorrupted(
+                        codingPath: codingPath,
+                        debugDescription: "SpectrumFrame compact decoded dB is non-finite"
+                    )
+                }
+                let value = pow(10.0, db / 10.0)
+                guard value.isFinite, value > 0 else {
+                    throw Self.dataCorrupted(
+                        codingPath: codingPath,
+                        debugDescription: "SpectrumFrame compact decoded PSD is not a positive finite value"
+                    )
+                }
+                decoded.append(value)
+            }
+            return decoded
+        }
+
+        guard channel.baseDB == nil, let fallback = channel.fallbackFloat64LE else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath,
+                debugDescription: "SpectrumFrame compact fallback channel has invalid metadata"
+            )
+        }
+        let expectedByteCount = try Self.expectedByteCount(
+            count: channel.count,
+            stride: MemoryLayout<UInt64>.stride,
+            codingPath: codingPath
+        )
+        guard fallback.count == expectedByteCount else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath,
+                debugDescription: "SpectrumFrame compact Float64 fallback length does not match count"
+            )
+        }
+        let decoded = try Self.decodeFloat64Channel(fallback, codingPath: codingPath)
+        guard decoded.count == channel.count else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath,
+                debugDescription: "SpectrumFrame compact Float64 fallback count does not match metadata"
+            )
+        }
+        return decoded
+    }
+
+    private static func expectedByteCount(
+        count: Int,
+        stride: Int,
+        codingPath: [CodingKey]
+    ) throws -> Int {
+        guard stride > 0, count <= Int.max / stride else {
+            throw Self.dataCorrupted(
+                codingPath: codingPath,
+                debugDescription: "SpectrumFrame compact channel count overflows its byte length"
+            )
+        }
+        return count * stride
     }
 
     private static func encodeFloat64Channel(_ channel: [Double]) -> Data {
@@ -399,23 +707,31 @@ public struct SpectrumFrame: Codable, Sendable, Equatable {
 
     private static func decodeFloat64Channels(_ encodedChannels: [Data], codingPath: [CodingKey]) throws -> [[Double]] {
         try encodedChannels.enumerated().map { channelIndex, data in
-            let stride = MemoryLayout<UInt64>.stride
-            guard data.count % stride == 0 else {
-                let path = codingPath + [CodingKeys.powerSpectralDensityByChannelFloat64LE, ArrayCodingKey(index: channelIndex)]
-                throw DecodingError.dataCorrupted(.init(
-                    codingPath: path,
-                    debugDescription: "Spectrum Float64 channel data length " + String(data.count) + " is not divisible by " + String(stride)
-                ))
-            }
-
-            var words = [UInt64](repeating: 0, count: data.count / stride)
-            words.withUnsafeMutableBytes { destination in
-                data.withUnsafeBytes { source in
-                    destination.copyBytes(from: source)
-                }
-            }
-            return words.map { Double(bitPattern: UInt64(littleEndian: $0)) }
+            let path = codingPath + [CodingKeys.powerSpectralDensityByChannelFloat64LE, ArrayCodingKey(index: channelIndex)]
+            return try Self.decodeFloat64Channel(data, codingPath: path)
         }
+    }
+
+    private static func decodeFloat64Channel(_ data: Data, codingPath: [CodingKey]) throws -> [Double] {
+        let stride = MemoryLayout<UInt64>.stride
+        guard data.count % stride == 0 else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: codingPath,
+                debugDescription: "Spectrum Float64 channel data length " + String(data.count) + " is not divisible by " + String(stride)
+            ))
+        }
+
+        var words = [UInt64](repeating: 0, count: data.count / stride)
+        words.withUnsafeMutableBytes { destination in
+            data.withUnsafeBytes { source in
+                destination.copyBytes(from: source)
+            }
+        }
+        return words.map { Double(bitPattern: UInt64(littleEndian: $0)) }
+    }
+
+    private static func dataCorrupted(codingPath: [CodingKey], debugDescription: String) -> DecodingError {
+        DecodingError.dataCorrupted(.init(codingPath: codingPath, debugDescription: debugDescription))
     }
 
     private struct ArrayCodingKey: CodingKey {
@@ -439,6 +755,36 @@ public struct SpectrumFrame: Codable, Sendable, Equatable {
     }
 }
 
+/// Describes the optional on-disk frequency aggregation attached to a
+/// `SpectrumFeatures` artifact.  Legacy native-FFT artifacts leave this
+/// metadata nil.  Compact artifacts keep the same frame timeline and channel
+/// layout, but each stored value is a band-averaged PSD density reconstructed
+/// from complete native FFT cells.
+public struct CompactSpectrumStorageMetadata: Codable, Sendable, Equatable {
+    public let version: String
+    public let bandsPerOctave: Int
+    public let powerRepresentation: String
+    public let quantizationErrorDescription: String
+    public let sourceAnalyzerVersion: String
+    public let nativeBinCount: Int
+
+    public init(
+        version: String = "compact-v1",
+        bandsPerOctave: Int,
+        powerRepresentation: String = "native-cell-integrated-power-divided-by-explicit-cell-width",
+        quantizationErrorDescription: String = "Float64 values are exact before optional storage encoding; UInt16 log-power encoding rounds non-zero values to at most ±0.005 dB (about 0.12% relative power) and uses an explicit zero sentinel.",
+        sourceAnalyzerVersion: String,
+        nativeBinCount: Int
+    ) {
+        self.version = version
+        self.bandsPerOctave = bandsPerOctave
+        self.powerRepresentation = powerRepresentation
+        self.quantizationErrorDescription = quantizationErrorDescription
+        self.sourceAnalyzerVersion = sourceAnalyzerVersion
+        self.nativeBinCount = nativeBinCount
+    }
+}
+
 public struct SpectrumFeatures: Codable, Sendable, Equatable {
     public let recordingID: UUID?
     public let sampleRate: Double
@@ -456,6 +802,13 @@ public struct SpectrumFeatures: Codable, Sendable, Equatable {
     public let format: AudioFormatMetadata
     public let parameters: SpectrumAnalysisParameters
     public let analyzerVersion: String
+    /// Explicit cell edges for compact frequency grids.  Native legacy
+    /// artifacts leave this nil and retain the historical midpoint-cell
+    /// interpretation of `frequencyBinsHz`.
+    public let frequencyCellEdgesHz: [Double]?
+    /// Provenance and representation metadata for compact artifacts.  A nil
+    /// value means the frame arrays contain native FFT-bin PSD values.
+    public let compactStorage: CompactSpectrumStorageMetadata?
 
     public init(
         recordingID: UUID? = nil,
@@ -470,7 +823,9 @@ public struct SpectrumFeatures: Codable, Sendable, Equatable {
         frequencyValidity: FrequencyValidity = .unknown,
         format: AudioFormatMetadata,
         parameters: SpectrumAnalysisParameters,
-        analyzerVersion: String = "1"
+        analyzerVersion: String = "1",
+        frequencyCellEdgesHz: [Double]? = nil,
+        compactStorage: CompactSpectrumStorageMetadata? = nil
     ) {
         self.recordingID = recordingID
         self.sampleRate = sampleRate
@@ -485,6 +840,8 @@ public struct SpectrumFeatures: Codable, Sendable, Equatable {
         self.format = format
         self.parameters = parameters
         self.analyzerVersion = analyzerVersion
+        self.frequencyCellEdgesHz = frequencyCellEdgesHz
+        self.compactStorage = compactStorage
     }
 }
 
